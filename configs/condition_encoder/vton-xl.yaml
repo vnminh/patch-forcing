@@ -1,0 +1,8 @@
+target: patch_flow.vton_condition_encoder.VTONConditionEncoder
+params:
+  latent_dim: 32
+  hidden_dim: 1152
+  patch_size: 2
+  garment_head_dim: 96
+  garment_refiner_depth: 2
+  compile: false

@@ -1,0 +1,22 @@
+target: patch_flow.dataloader.DataModuleFromConfig
+params:
+  batch_size: 1
+  val_batch_size: 1
+  num_workers: 4
+  shuffle_validation: false
+  train:
+    target: patch_flow.viton_dataset.VitonHDDataset
+    params:
+      root: ../../high-resolution-viton-zalando-dataset
+      split: train
+      height: 1024
+      width: 768
+      random_horizontal_flip: false
+  validation:
+    target: patch_flow.viton_dataset.VitonHDDataset
+    params:
+      root: ../../high-resolution-viton-zalando-dataset
+      split: test
+      height: 1024
+      width: 768
+      random_horizontal_flip: false

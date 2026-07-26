@@ -1,0 +1,12 @@
+target: patch_flow.models.pf_transformer_vton.PatchForcingTransformerVTON
+params:
+  latent_dim: 32
+  depth: 28
+  hidden_dim: 1152
+  head_dim: 72
+  mapping_dim: 384
+  mapping_depth: 2
+  patch_size: 2
+  garment_dim: 1152
+  compile: false
+  gradient_checkpointing: true

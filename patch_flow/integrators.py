@@ -11,6 +11,36 @@ from patch_flow.flow_pf import pad_v_like_x_patches
 # ===================================================================================================
 
 
+def _expand_unconditional_condition(uc_cond, cond, batch_size):
+    if uc_cond.shape[0] == 1:
+        uc_cond = einops.repeat(uc_cond, "1 ... -> bs ...", bs=batch_size)
+    if uc_cond.shape != cond.shape:
+        raise ValueError(f"Unconditional condition shape {uc_cond.shape} must match conditional shape {cond.shape}.")
+    return uc_cond
+
+
+def _cfg_model_kwargs(model_kwargs, uc_cond, cond_key, batch_size):
+    """Build a doubled conditional batch for legacy single and VTON dict conditions."""
+    kwargs = model_kwargs.copy()
+    if isinstance(uc_cond, dict):
+        for key, unconditional in uc_cond.items():
+            if key not in kwargs:
+                raise KeyError(f"Condition key '{key}' for CFG not found in model_kwargs.")
+            conditional = kwargs[key]
+            kwargs[key] = torch.cat(
+                [_expand_unconditional_condition(unconditional, conditional, batch_size), conditional], dim=0
+            )
+        return kwargs
+
+    if cond_key not in kwargs:
+        raise KeyError(f"Condition key '{cond_key}' for CFG not found in model_kwargs.")
+    conditional = kwargs[cond_key]
+    kwargs[cond_key] = torch.cat(
+        [_expand_unconditional_condition(uc_cond, conditional, batch_size), conditional], dim=0
+    )
+    return kwargs
+
+
 def forward_with_cfg_and_uncertainty(x, t, model, cfg_scale=1.0, uc_cond=None, cond_key="y", **model_kwargs):
     """Function to include sampling with Classifier-Free Guidance (CFG)"""
     if cfg_scale == 1.0:  # without CFG
@@ -19,16 +49,10 @@ def forward_with_cfg_and_uncertainty(x, t, model, cfg_scale=1.0, uc_cond=None, c
         out = {"vt": model_vt, "uq": model_uq, "uq_uc": None, "uq_c": model_uq, "vt_uc": None, "vt_c": model_vt}
 
     else:  # with CFG
-        assert cond_key in model_kwargs, f"Condition key '{cond_key}' for CFG not found in model_kwargs"
         assert uc_cond is not None, "Unconditional condition not provided for CFG"
-        kwargs = model_kwargs.copy()
-        c = kwargs[cond_key]
+        kwargs = _cfg_model_kwargs(model_kwargs, uc_cond, cond_key, x.shape[0])
         x_in = torch.cat([x] * 2)
         t_in = torch.cat([t] * 2)
-        if uc_cond.shape[0] == 1:
-            uc_cond = einops.repeat(uc_cond, "1 ... -> bs ...", bs=x.shape[0])
-        c_in = torch.cat([uc_cond, c])
-        kwargs[cond_key] = c_in
         model_output = model(x_in, t_in, **kwargs, return_uncertainty=True)
         model_vt, model_uq = model_output
         model_vt_uc, model_vt_c = model_vt.chunk(2)
@@ -54,16 +78,10 @@ def forward_with_cfg(x, t, model, cfg_scale=1.0, uc_cond=None, cond_key="y", **m
         model_output = model(x, t, **model_kwargs)
 
     else:  # with CFG
-        assert cond_key in model_kwargs, f"Condition key '{cond_key}' for CFG not found in model_kwargs"
         assert uc_cond is not None, "Unconditional condition not provided for CFG"
-        kwargs = model_kwargs.copy()
-        c = kwargs[cond_key]
+        kwargs = _cfg_model_kwargs(model_kwargs, uc_cond, cond_key, x.shape[0])
         x_in = torch.cat([x] * 2)
         t_in = torch.cat([t] * 2)
-        if uc_cond.shape[0] == 1:
-            uc_cond = einops.repeat(uc_cond, "1 ... -> bs ...", bs=x.shape[0])
-        c_in = torch.cat([uc_cond, c])
-        kwargs[cond_key] = c_in
         model_uc, model_c = model(x_in, t_in, **kwargs).chunk(2)
         model_output = model_uc + cfg_scale * (model_c - model_uc)
 

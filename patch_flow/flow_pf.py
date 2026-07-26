@@ -19,6 +19,34 @@ def exists(x):
     return x is not None
 
 
+def _expand_unconditional_condition(uc_cond, cond, batch_size):
+    if uc_cond.shape[0] == 1:
+        uc_cond = einops.repeat(uc_cond, "1 ... -> bs ...", bs=batch_size)
+    if uc_cond.shape != cond.shape:
+        raise ValueError(f"Unconditional condition shape {uc_cond.shape} must match conditional shape {cond.shape}.")
+    return uc_cond
+
+
+def _cfg_model_kwargs(model_kwargs, uc_cond, cond_key, batch_size):
+    kwargs = model_kwargs.copy()
+    if isinstance(uc_cond, dict):
+        for key, unconditional in uc_cond.items():
+            if key not in kwargs:
+                raise KeyError(f"Condition key '{key}' for CFG not found in model_kwargs.")
+            conditional = kwargs[key]
+            kwargs[key] = torch.cat(
+                [_expand_unconditional_condition(unconditional, conditional, batch_size), conditional], dim=0
+            )
+        return kwargs
+    if cond_key not in kwargs:
+        raise KeyError(f"Condition key '{cond_key}' for CFG not found in model_kwargs.")
+    conditional = kwargs[cond_key]
+    kwargs[cond_key] = torch.cat(
+        [_expand_unconditional_condition(uc_cond, conditional, batch_size), conditional], dim=0
+    )
+    return kwargs
+
+
 def pad_v_like_x(v_, x_):
     """
     Reshape or broadcast v_ to match the number of dimensions of x_ by appending singleton dims.
@@ -45,16 +73,10 @@ def forward_with_cfg(
             t_val = t[0].item()
             if not t_min <= t_val <= t_max:  # no cfg outside of the interval
                 return model(x, t, **model_kwargs)
-        assert cond_key in model_kwargs, f"Condition key '{cond_key}' for CFG not found in model_kwargs"
         assert uc_cond is not None, "Unconditional condition not provided for CFG"
-        kwargs = model_kwargs.copy()
-        c = kwargs[cond_key]
+        kwargs = _cfg_model_kwargs(model_kwargs, uc_cond, cond_key, x.shape[0])
         x_in = torch.cat([x] * 2)
         t_in = torch.cat([t] * 2)
-        if uc_cond.shape[0] == 1:
-            uc_cond = einops.repeat(uc_cond, "1 ... -> bs ...", bs=x.shape[0])
-        c_in = torch.cat([uc_cond, c])
-        kwargs[cond_key] = c_in
         model_uc, model_c = model(x_in, t_in, **kwargs).chunk(2)
         return model_uc + cfg_scale * (model_c - model_uc)
 

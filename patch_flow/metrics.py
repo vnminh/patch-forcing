@@ -4,7 +4,13 @@ import torch.nn as nn
 from torchmetrics import CatMetric
 from torchmetrics import SumMetric  # sum over devices
 from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.multimodal.clip_score import CLIPScore
+
+try:
+    from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+except ImportError:  # optional in some torchmetrics installations
+    LearnedPerceptualImagePatchSimilarity = None
 
 from jutils.nn import DINOv2, preprocess_for_dinov2
 from jutils.nn.metric_kid import kid_features_to_metric
@@ -47,6 +53,51 @@ class ImageMetricTracker(nn.Module):
             f"fid-{n_total_samples}": self.fid.compute(),
             "n_metric_samples": n_total_samples,
         }
+
+
+class VitonMetricTracker(nn.Module):
+    """Image-space VITON metrics without text-specific scoring."""
+
+    def __init__(self, use_lpips: bool = False):
+        super().__init__()
+        self.total_samples = SumMetric()
+        self.fid = FrechetInceptionDistance(
+            feature=2048, reset_real_features=True, normalize=False, sync_on_compute=True
+        )
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=2.0)
+        self.lpips = None
+        if use_lpips:
+            if LearnedPerceptualImagePatchSimilarity is None:
+                raise ImportError("LPIPS metric is not available in the installed torchmetrics package.")
+            self.lpips = LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=False)
+
+    @torch.no_grad()
+    def __call__(self, target, pred):
+        bs = target.shape[0]
+        self.fid.update(un_normalize_ims(target), real=True)
+        self.fid.update(un_normalize_ims(pred), real=False)
+        self.ssim.update(pred, target)
+        if self.lpips is not None:
+            self.lpips.update(pred, target)
+        self.total_samples.update(bs)
+
+    def reset(self):
+        self.fid.reset()
+        self.ssim.reset()
+        if self.lpips is not None:
+            self.lpips.reset()
+        self.total_samples.reset()
+
+    def aggregate(self):
+        n_total_samples = int(self.total_samples.compute())
+        metrics = {
+            f"fid-{n_total_samples}": self.fid.compute(),
+            "ssim": self.ssim.compute(),
+            "n_metric_samples": n_total_samples,
+        }
+        if self.lpips is not None:
+            metrics["lpips"] = self.lpips.compute()
+        return metrics
 
 
 class Text2ImageMetricTracker(nn.Module):

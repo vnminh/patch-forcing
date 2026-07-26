@@ -1,0 +1,32 @@
+target: patch_flow.trainer_vton.PatchForcingVTONTrainer
+params:
+  model: ${oc.select:model, null}
+  first_stage: ${oc.select:autoencoder, null}
+  condition_encoder:
+    target: patch_flow.vton_condition_encoder.VTONConditionEncoder
+    params:
+      latent_dim: ${model.params.latent_dim}
+      hidden_dim: ${model.params.hidden_dim}
+      patch_size: ${model.params.patch_size}
+      garment_head_dim: 96
+      garment_refiner_depth: 2
+      compile: ${compile}
+  flow:
+    target: patch_flow.flow_pf.PatchFlowForcing
+    params:
+      patch_size: ${model.params.patch_size}
+      timestep_sampler:
+        target: patch_flow.timestep_schedules.LogitNormalTruncatedGaussian
+        params:
+          std: 0.6
+          loc: 0.5
+          scale: 1.0
+  lr: 1.0e-4
+  weight_decay: 0.0
+  ema_rate: 0.9999
+  lr_scheduler_cfg: ${oc.select:lr_scheduler, null}
+  uncertainty_weight: 0.01
+  condition_dropout_prob: 0.1
+  use_lpips: false
+  sample_kwargs:
+    num_steps: 50
