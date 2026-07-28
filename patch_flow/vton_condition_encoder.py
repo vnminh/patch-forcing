@@ -118,7 +118,7 @@ class VTONConditionEncoder(nn.Module):
     def _garment_tokens(self, cloth: torch.Tensor, cloth_mask: torch.Tensor) -> torch.Tensor:
         if cloth_mask.shape[1] != 1:
             raise ValueError(f"cloth_mask must have one channel, got {cloth_mask.shape}.")
-        garment_input = torch.cat([cloth * cloth_mask, cloth_mask], dim=1)
+        garment_input = torch.cat([cloth, cloth_mask], dim=1)
         features = self.garment_encoder(garment_input)
         b, _, h, w = features.shape
         pos = make_axial_pos_2d(h, w, device=features.device)

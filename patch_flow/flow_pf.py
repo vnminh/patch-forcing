@@ -38,6 +38,7 @@ def _cfg_model_kwargs(model_kwargs, uc_cond, cond_key, batch_size):
                 [_expand_unconditional_condition(unconditional, conditional, batch_size), conditional], dim=0
             )
         return kwargs
+    # 1 condition
     if cond_key not in kwargs:
         raise KeyError(f"Condition key '{cond_key}' for CFG not found in model_kwargs.")
     conditional = kwargs[cond_key]
