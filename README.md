@@ -119,6 +119,16 @@ pip install -r requirements.txt
 
 If the default install fails on your machine, follow the safer install order noted in ?`requirements.txt`: install `torch` and `torchvision` first, then `flash-attn`, then the remaining requirements.
 
+For an automated VTON setup, run:
+
+```bash
+bash setup.sh
+conda activate pft-vton
+export PFT_XL_CKPT="$PWD/checkpoints/pft-xl_step400k_ema.ckpt"
+```
+
+The script installs the pinned CUDA 12.8 dependencies, downloads PFT-XL and Stability AI's EMA SD VAE, verifies the VAE SHA-256 checksum, converts it to the bare state dictionary expected by `jutils`, and strictly loads both checkpoints. It is resumable and skips existing downloads. Useful overrides include `ENV_NAME`, `CHECKPOINTS_DIR`, `USE_CURRENT_ENV=1`, `SKIP_INSTALL=1`, `SKIP_VERIFY=1`, and `FORCE_DOWNLOAD=1`. Set `INSTALL_FLASH_ATTN=1` only when it is needed and the machine has a compatible CUDA build toolchain.
+
 We release two [Patch Forcing Transformer](https://ommer-lab.com/files/pft/) checkpoints: [PFT-B](https://ommer-lab.com/files/pft/pft-b_step400k_ema.ckpt) and [PFT-XL](https://ommer-lab.com/files/pft/pft-xl_step400k_ema.ckpt). The checkpoints contain the EMA weights, as well as the model config.
 
 ### Class-Conditional Generation

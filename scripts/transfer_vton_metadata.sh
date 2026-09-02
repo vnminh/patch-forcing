@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 3 ]]; then
-    echo "Usage: $0 LOCAL_VITON_ROOT REMOTE_VITON_ROOT [REMOTE_HOST]"
-    exit 2
-fi
 
-local_root=${1%/}
-remote_root=${2%/}
+local_root="/home/minh-le-vo-nhat/Documents/Minh-DUT/NCKH/NewAttempt2627/high-resolution-viton-zalando-dataset"
+remote_root="/home/azr-ai/Documents/archive"
 remote_host=${3:-azr-ai@100.75.140.87}
 
 for path in "$local_root" "$remote_root"; do
