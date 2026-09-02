@@ -267,7 +267,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             )
             garment_features = garment_features.flatten(2).transpose(1, 2)
             garment_features = self.garment_feature_norm(garment_features)
-            dino_tokens = self.garment_feature_proj(garment_features).to(x.dtype)
+            dino_tokens = self.garment_feature_proj(garment_features).to(x.dtype) + position
             garment_tokens = dino_tokens if garment_tokens is None else garment_tokens + dino_tokens
         if garment_tokens is not None:
             garment_keep = self._token_mask(garment_mask, (height, width))
