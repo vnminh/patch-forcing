@@ -6,7 +6,7 @@ params:
     target: patch_flow.flow_vton.VTONPatchFlowForcing
     params:
       patch_size: 2
-      mask_dilation_tokens: 1
+      mask_dilation_tokens: 0
       mask_dilation_jitter_tokens: 1
       timestep_sampler:
         target: patch_flow.timestep_schedules.LogitNormalTruncatedGaussian

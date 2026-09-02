@@ -45,6 +45,7 @@ train_params:
   log_every_n_steps: 1        # gradient update steps
   limit_val_batches: 8        # per GPU
   val_check_interval: 5000    # steps, regardless of gradient accumulation
+  validation_steps: []        # optional explicit one-shot validation steps
   precision: bf16-mixed
   clip_grad_norm: 1.0
 

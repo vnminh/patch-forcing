@@ -11,7 +11,7 @@ class VTONPatchFlowForcing:
         self,
         timestep_sampler=None,
         patch_size=2,
-        mask_dilation_tokens=1,
+        mask_dilation_tokens=0,
         mask_dilation_jitter_tokens=0,
     ):
         self.patch_size = int(patch_size)

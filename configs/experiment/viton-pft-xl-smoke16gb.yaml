@@ -33,11 +33,12 @@ data:
     val_batch_size: 2
 
 checkpoint_params:
-  every_n_train_steps: 25
+  every_n_train_steps: 500
 
 train_params:
-  max_steps: 50
+  max_steps: 1000
   accumulate_grad_batches: 4
   limit_val_batches: 1
-  val_check_interval: 10
+  val_check_interval: 5
+  validation_steps: []
   precision: bf16-mixed

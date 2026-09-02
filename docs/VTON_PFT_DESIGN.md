@@ -70,7 +70,7 @@ The token mask is morphologically dilated:
 M_T^+ = \operatorname{Dilate}(M_T, r).
 \]
 
-The normal configuration uses one token of dilation and randomly adds zero or one extra token during training. Thus training normally sees one- or two-token expansions.
+The normal configuration applies no additional token-grid dilation because max-pooling already rounds the supplied mask outward to complete PFT tokens. During training, zero or one extra token is sampled as robustness jitter. Validation and inference use only the max-pooled token envelope. This preserves more clean outside-person context than the earlier one- or two-token expansion.
 
 With the current SD VAE downsampling factor of 8 and PFT patch size 2, one PFT token covers approximately \(16\times16\) input pixels.
 
@@ -588,7 +588,7 @@ logs/<experiment>/<date>/<run>/previews/stepXXXXXX.png
 logs/<experiment>/<date>/<run>/previews/latest.png
 ```
 
-Each row is one validation example. Columns are ordered as target, source person, expanded agnostic person, garment, and try-on output. In the smoke split, the first row is paired and the second row is unpaired.
+Each row is one validation example. Columns are ordered as target, source person, expanded agnostic person, effective edit mask, garment, and try-on output. In the smoke split, the first row is paired and the second row is unpaired.
 
 ### Smoke-test example
 
@@ -596,16 +596,16 @@ The supplied 16 GB configuration uses:
 
 ```yaml
 train_params:
-  max_steps: 50
+  max_steps: 1000
   accumulate_grad_batches: 4
-  val_check_interval: 10
+  val_check_interval: 5
   limit_val_batches: 1
 
 checkpoint_params:
-  every_n_train_steps: 25
+  every_n_train_steps: 500
 ```
 
-It therefore produces previews at optimizer steps 10, 20, 30, 40, and 50, and checkpoints at steps 25 and 50.
+It therefore produces previews at optimizer steps 5, 10, 15, and so on through step 1000, and checkpoints at steps 500 and 1000.
 
 Settings can be changed without editing YAML:
 

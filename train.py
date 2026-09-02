@@ -307,6 +307,9 @@ def main(cfg: DictConfig):
     """ Setup training loop """
     global_step = resume_step
     max_steps = cfg.train_params.get("max_steps", -1)
+    validation_steps = {int(step) for step in cfg.train_params.get("validation_steps", [])}
+    if any(step <= 0 for step in validation_steps):
+        raise ValueError("train_params.validation_steps must contain positive optimizer steps")
     use_cuda_prefetch = bool(cfg.get("cuda_prefetch", False)) and device.type == "cuda"
     train_iterable = (
         CUDAPrefetchIterator(
@@ -440,7 +443,10 @@ def main(cfg: DictConfig):
         # ===================== #
         # Validation            #
         # ===================== #
-        if global_step % cfg.train_params.val_check_interval == 0 and global_step > 0:
+        validation_interval = int(cfg.train_params.val_check_interval)
+        periodic_validation = validation_interval > 0 and global_step % validation_interval == 0
+        explicit_validation = global_step in validation_steps
+        if global_step > 0 and (periodic_validation or explicit_validation):
 
             module.eval()
             n_val_steps = cfg.train_params.limit_val_batches

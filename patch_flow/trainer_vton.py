@@ -150,6 +150,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             "outside_velocity_loss": outside_loss,
             "sigma_loss": uncertainty_loss,
             "editable_fraction": masks.latent.mean(),
+            "outside_fraction": outside.mean(),
         }
 
     @torch.no_grad()
@@ -182,10 +183,12 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             elif has_ground_truth.any():
                 self.metric_tracker(target_image[has_ground_truth], composed[has_ground_truth])
         if self.val_images is None:
+            mask_preview = (expanded[:8].repeat(1, 3, 1, 1) * 255).clamp(0, 255).to(torch.uint8)
             self.val_images = {
                 "target": un_normalize_ims(target_image[:8]),
                 "person": un_normalize_ims(person_image[:8]),
                 "agnostic": un_normalize_ims(agnostic_image[:8]),
+                "edit_mask": mask_preview,
                 "garment": un_normalize_ims(batch["garment"][:8]),
                 "tryon": un_normalize_ims(composed[:8]),
             }
@@ -208,7 +211,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         log_dir = getattr(self.logger, "log_dir", None)
         if not isinstance(log_dir, (str, os.PathLike)) or self.val_images is None:
             return
-        keys = ("target", "person", "agnostic", "garment", "tryon")
+        keys = ("target", "person", "agnostic", "edit_mask", "garment", "tryon")
         rows = torch.stack([self.val_images[key] for key in keys], dim=1)
         rows = rows.flatten(0, 1).float().cpu() / 255
         preview_dir = os.path.join(log_dir, "previews")

@@ -251,9 +251,9 @@ export PFT_XL_CKPT=/remote/path/checkpoints/pft-xl_step400k_ema.ckpt
 python train.py experiment=viton-pft-xl-smoke16gb
 ```
 
-This configuration uses batch size 1, four-step gradient accumulation, gradient checkpointing, adapter-only optimization, no EMA copy, eight-step validation sampling, 50 optimizer steps, and no statistical validation metrics. Its validation batch still saves both paired and unpaired try-on images.
+This configuration uses batch size 1, four-step gradient accumulation, gradient checkpointing, adapter-only optimization, no EMA copy, eight-step validation sampling, 1000 optimizer steps, and no statistical validation metrics. Its validation batch still saves both paired and unpaired try-on images.
 
-Validation preview sheets are saved periodically under `logs/<experiment>/<date>/<run>/previews/`. The smoke configuration validates every 10 optimizer steps and saves `stepXXXXXX.png` plus an updated `latest.png`. Configure training and preview periods from the command line:
+Validation preview sheets are saved periodically under `logs/<experiment>/<date>/<run>/previews/`. The smoke configuration validates every 5 optimizer steps and saves `stepXXXXXX.png` plus an updated `latest.png`. Configure training and preview periods from the command line:
 
 ```bash
 python train.py experiment=viton-pft-xl-smoke16gb \
