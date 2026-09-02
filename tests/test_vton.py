@@ -6,6 +6,7 @@ from patch_flow.flow_vton import VTONPatchFlowForcing
 from patch_flow.models.pf_transformer import PatchForcingDiT
 from patch_flow.models.pf_transformer_vton import VTONPatchForcingDiT
 from patch_flow.vton_utils import compose_vton, prepare_vton_masks
+from train import repeat_dataloader
 
 
 class ConstantVelocityModel(torch.nn.Module):
@@ -17,6 +18,10 @@ class ConstantVelocityModel(torch.nn.Module):
 
 
 class VTONTests(unittest.TestCase):
+    def test_finite_dataloader_repeats_until_step_limit(self):
+        batches = repeat_dataloader([0, 1, 2, 3], max_epochs=-1)
+        self.assertEqual([next(batches) for _ in range(10)], [0, 1, 2, 3, 0, 1, 2, 3, 0, 1])
+
     def test_zero_initialized_model_matches_pft(self):
         torch.manual_seed(7)
         kwargs = dict(

@@ -119,6 +119,27 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
         return model
 
 
+def repeat_dataloader(loader, max_epochs=-1, iterator_wrapper=None):
+    """Iterate finite dataloaders across epochs without caching their batches."""
+    epoch = 0
+    while max_epochs < 0 or epoch < max_epochs:
+        if hasattr(loader, "set_epoch"):
+            loader.set_epoch(epoch)
+
+        iterator = iter(loader)
+        if iterator_wrapper is not None:
+            iterator = iterator_wrapper(iterator)
+
+        yielded_batch = False
+        for batch in iterator:
+            yielded_batch = True
+            yield batch
+
+        if not yielded_batch:
+            raise RuntimeError("Training dataloader yielded no batches")
+        epoch += 1
+
+
 """ main function """
 
 
@@ -311,15 +332,18 @@ def main(cfg: DictConfig):
     if any(step <= 0 for step in validation_steps):
         raise ValueError("train_params.validation_steps must contain positive optimizer steps")
     use_cuda_prefetch = bool(cfg.get("cuda_prefetch", False)) and device.type == "cuda"
-    train_iterable = (
-        CUDAPrefetchIterator(
-            iterator=iter(train_loader),
+    iterator_wrapper = None
+    if use_cuda_prefetch:
+        iterator_wrapper = partial(
+            CUDAPrefetchIterator,
             device=device,
             enabled=True,
             prefetch_factor=cfg.get("cuda_prefetch_factor", 2),
         )
-        if use_cuda_prefetch
-        else train_loader
+    train_iterable = repeat_dataloader(
+        train_loader,
+        max_epochs=int(cfg.train_params.get("max_epochs", -1)),
+        iterator_wrapper=iterator_wrapper,
     )
 
     # Loop
