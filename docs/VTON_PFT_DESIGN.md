@@ -453,7 +453,8 @@ Self-attention can use clean face, hair, body boundary, pose, and background tok
 - \(x_t\) represents the current generated state.
 - \(z_a\) represents person identity and spatial context without the old garment.
 - the soft mask identifies the editable boundary.
-- \(f_g\) represents semantic and high-frequency garment appearance.
+- VAE garment tokens preserve local color, texture, boundaries, and fine appearance.
+- DINO garment tokens provide complementary semantic structure.
 - \(M_g\) removes irrelevant garment background keys.
 - per-token time tells the model how reliable each spatial token currently is.
 
@@ -483,7 +484,7 @@ This mode is intended to validate data flow, checkpoint transfer, gradients, los
 1. PFT-XL was pretrained on a square grid. The implementation supports 512-by-384 fine-tuning through positional interpolation, but this remains resolution transfer rather than native rectangular pretraining.
 2. One token equals roughly 16 input pixels. This handles small parsing errors but not large category topology changes by itself.
 3. The implementation has no DensePose or explicit pose encoder. It relies on agnostic spatial context and visible body boundaries.
-4. DINO features preserve semantic patterns and logos better than SD-VAE latents, but exact readable text is still not guaranteed without a dedicated text/detail loss.
+4. Joint VAE and DINO conditioning combines photometric and semantic evidence, but exact readable text is still not guaranteed without a dedicated text/detail path or loss.
 5. Adaptive uncertainty is meaningful only after the head has been trained on the VTON distribution.
 6. Unpaired validation has no pixel-aligned ground truth. It should be judged qualitatively or with garment/person-specific metrics, not SSIM against the input person.
 

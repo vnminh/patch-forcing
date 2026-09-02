@@ -267,7 +267,7 @@ class VTONTests(unittest.TestCase):
         output.square().mean().backward()
         self.assertGreater(model.garment_feature_proj.weight.grad.abs().sum().item(), 0)
 
-    def test_dino_garment_tokens_include_position_embedding(self):
+    def test_joint_garment_tokens_add_position_once(self):
         model = VTONPatchForcingDiT(
             input_size=8,
             patch_size=2,
@@ -278,13 +278,15 @@ class VTONTests(unittest.TestCase):
             num_classes=10,
             predict_uncertainty=True,
             garment_feature_dim=32,
-            use_vae_garment=False,
+            use_vae_garment=True,
             cross_attention_every=1,
             compile=False,
         ).eval()
         with torch.no_grad():
             model.garment_feature_proj.weight.zero_()
             model.garment_feature_proj.bias.zero_()
+            model.garment_embedder.proj.weight.zero_()
+            model.garment_embedder.proj.bias.zero_()
         captured = {}
 
         def capture_tokens(_, inputs):
@@ -301,6 +303,7 @@ class VTONTests(unittest.TestCase):
                 person_agnostic=torch.randn_like(latent),
                 person_mask=mask,
                 edit_mask=mask,
+                garment=torch.randn_like(latent),
                 garment_mask=mask,
                 garment_features=torch.randn(1, 32, 5, 4),
             )

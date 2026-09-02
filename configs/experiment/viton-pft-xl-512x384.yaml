@@ -12,7 +12,7 @@ model:
   params:
     gradient_checkpointing: true
     garment_feature_dim: 384
-    use_vae_garment: false
+    use_vae_garment: true
 
 data:
   params:

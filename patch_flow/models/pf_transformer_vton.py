@@ -248,7 +248,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_padding_mask = None
         if garment is not None and self.garment_embedder is not None:
             garment = F.interpolate(garment, size=(height, width), mode="bilinear", align_corners=False)
-            garment_tokens = self.garment_embedder(garment) + position
+            garment_tokens = self.garment_embedder(garment)
         if garment_features is not None:
             if self.garment_feature_proj is None:
                 raise ValueError("garment_feature_dim must be configured when garment_features are provided")
@@ -267,9 +267,10 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             )
             garment_features = garment_features.flatten(2).transpose(1, 2)
             garment_features = self.garment_feature_norm(garment_features)
-            dino_tokens = self.garment_feature_proj(garment_features).to(x.dtype) + position
+            dino_tokens = self.garment_feature_proj(garment_features).to(x.dtype)
             garment_tokens = dino_tokens if garment_tokens is None else garment_tokens + dino_tokens
         if garment_tokens is not None:
+            garment_tokens = garment_tokens + position
             garment_keep = self._token_mask(garment_mask, (height, width))
             if garment_keep is not None:
                 empty = ~garment_keep.any(dim=1)
