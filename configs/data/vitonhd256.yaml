@@ -1,0 +1,22 @@
+name: VITON-HD-256
+target: patch_flow.dataloader.DataModuleFromConfig
+params:
+  batch_size: 4
+  val_batch_size: 4
+  num_workers: 4
+  train:
+    target: patch_flow.vton_data.VTONHDDataset
+    params:
+      root: ${oc.env:VITONHD_ROOT}
+      split: train
+      image_size: 256
+      random_flip: true
+      paired: true
+  validation:
+    target: patch_flow.vton_data.VTONHDDataset
+    params:
+      root: ${oc.env:VITONHD_ROOT}
+      split: test
+      image_size: 256
+      random_flip: false
+      paired: true

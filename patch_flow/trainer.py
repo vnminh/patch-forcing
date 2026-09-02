@@ -65,6 +65,7 @@ class LatentFlowTrainer(LightningModule):
         lr_scheduler_cfg: dict = None,
         # logging
         sample_kwargs: dict = None,
+        enable_metrics: bool = True,
     ):
         super().__init__()
 
@@ -103,7 +104,7 @@ class LatentFlowTrainer(LightningModule):
         self.generator = torch.Generator()
 
         # evaluation
-        self.metric_tracker = ImageMetricTracker().to(self.device)
+        self.metric_tracker = ImageMetricTracker().to(self.device) if enable_metrics else None
 
         # SD3 & Meta Movie Gen show that val loss correlates with human quality
         # and compute the loss in equidistant segments in (0, 1) to reduce variance

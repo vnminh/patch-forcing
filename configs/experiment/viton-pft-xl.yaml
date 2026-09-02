@@ -1,0 +1,21 @@
+# @package _global_
+defaults:
+  - override /trainer: vton_patch_flow
+  - override /data: vitonhd256
+  - override /model: vton-pft-xl
+  - override /autoencoder: sd_ae
+  - override /lr_scheduler: constant
+
+name: vton/pft-xl-256
+
+data:
+  params:
+    batch_size: 4
+    val_batch_size: 4
+
+train_params:
+  max_steps: 100000
+  limit_val_batches: 16
+  val_check_interval: 5000
+  precision: bf16-mixed
+

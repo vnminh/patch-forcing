@@ -1,0 +1,17 @@
+name: Dummy-VTON-256
+target: patch_flow.dataloader.DataModuleFromConfig
+params:
+  batch_size: 2
+  val_batch_size: 2
+  num_workers: 0
+  train:
+    target: patch_flow.vton_data.DummyVTONDataset
+    params:
+      num_samples: 1024
+      image_size: 256
+  validation:
+    target: patch_flow.vton_data.DummyVTONDataset
+    params:
+      num_samples: 16
+      image_size: 256
+

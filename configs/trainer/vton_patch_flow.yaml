@@ -1,0 +1,30 @@
+target: patch_flow.trainer_vton.LatentVTONPatchForcingTrainer
+params:
+  model: ${oc.select:model, null}
+  first_stage: ${oc.select:autoencoder, null}
+  flow:
+    target: patch_flow.flow_vton.VTONPatchFlowForcing
+    params:
+      patch_size: 2
+      mask_dilation_tokens: 1
+      mask_dilation_jitter_tokens: 1
+      timestep_sampler:
+        target: patch_flow.timestep_schedules.LogitNormalTruncatedGaussian
+        params:
+          std: 0.6
+          loc: 0.7
+          scale: 1.0
+  lr: 1e-4
+  backbone_lr_multiplier: 0.1
+  weight_decay: 0.0
+  ema_rate: 0.9999
+  lr_scheduler_cfg: ${oc.select:lr_scheduler, null}
+  uncertainty_weight: 0.01
+  outside_velocity_weight: 0.01
+  garment_dropout_prob: 0.1
+  train_adapters_only: false
+  sample_kwargs:
+    num_steps: 30
+    cfg_scale: 1.0
+    adaptive: false
+    progress: false

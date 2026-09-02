@@ -1,0 +1,25 @@
+name: VITON-HD-Smoke-32
+target: patch_flow.dataloader.DataModuleFromConfig
+params:
+  batch_size: 1
+  val_batch_size: 2
+  num_workers: 2
+  train:
+    target: patch_flow.vton_data.VTONHDDataset
+    params:
+      root: ${oc.env:VITONHD_ROOT}
+      split: train
+      pair_list: ${oc.env:VITONHD_SMOKE_DIR}/train_pairs_32.txt
+      image_size: 256
+      random_flip: true
+      paired: true
+  validation:
+    target: patch_flow.vton_data.VTONHDDataset
+    params:
+      root: ${oc.env:VITONHD_ROOT}
+      split: test
+      pair_list: ${oc.env:VITONHD_SMOKE_DIR}/validation_pair_unpair.txt
+      image_size: 256
+      random_flip: false
+      paired: false
+

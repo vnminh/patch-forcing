@@ -1,0 +1,194 @@
+import torch
+
+from jutils import exists
+
+from patch_flow.diagonal_gaussian import DiagonalGaussian
+from patch_flow.log_utils import log_images
+from patch_flow.trainer import LatentFlowTrainer, un_normalize_ims
+from patch_flow.vton_utils import compose_vton, masked_mean
+
+
+class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
+    def __init__(
+        self,
+        *args,
+        uncertainty_weight=0.01,
+        outside_velocity_weight=0.01,
+        garment_dropout_prob=0.1,
+        train_adapters_only=False,
+        backbone_lr_multiplier=0.1,
+        compute_validation_metrics=True,
+        **kwargs,
+    ):
+        super().__init__(*args, enable_metrics=compute_validation_metrics, **kwargs)
+        self.uncertainty_weight = float(uncertainty_weight)
+        self.outside_velocity_weight = float(outside_velocity_weight)
+        self.garment_dropout_prob = float(garment_dropout_prob)
+        self.backbone_lr_multiplier = float(backbone_lr_multiplier)
+        self.train_adapters_only = bool(train_adapters_only)
+        self.compute_validation_metrics = bool(compute_validation_metrics)
+        if train_adapters_only:
+            for parameter in self.model.parameters():
+                parameter.requires_grad = False
+            for name, parameter in self.model.named_parameters():
+                if "garment_" in name or name.startswith("x_embedder") or name.startswith("final_layer"):
+                    parameter.requires_grad = True
+
+    def configure_optimizers(self):
+        adapter_parameters = []
+        backbone_parameters = []
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if "garment_" in name or ".x_embedder" in name:
+                adapter_parameters.append(parameter)
+            else:
+                backbone_parameters.append(parameter)
+        groups = []
+        if adapter_parameters:
+            groups.append({"params": adapter_parameters, "lr": self.lr})
+        if backbone_parameters:
+            groups.append({"params": backbone_parameters, "lr": self.lr * self.backbone_lr_multiplier})
+        optimizer = torch.optim.AdamW(groups, lr=self.lr, weight_decay=self.weight_decay)
+        output = {"optimizer": optimizer}
+        if exists(self.lr_scheduler_cfg):
+            from jutils import load_partial_from_config
+
+            output["lr_scheduler"] = load_partial_from_config(self.lr_scheduler_cfg)(optimizer=optimizer)
+        return output
+
+    def _label(self, batch, batch_size, device):
+        label = batch.get("label")
+        if label is not None:
+            return label.long().view(batch_size).to(device)
+        return torch.full(
+            (batch_size,),
+            self.model.y_embedder.num_classes,
+            device=device,
+            dtype=torch.long,
+        )
+
+    def _encode_batch(self, batch):
+        target = batch["image"]
+        person = batch.get("person", target)
+        garment = batch["garment"]
+        target_latent = batch.get("latent")
+        garment_latent = batch.get("garment_latent")
+        if target_latent is None:
+            target_latent = self.encode(target)
+        dilation = self.flow.sample_training_dilation() if self.training else self.flow.mask_dilation_tokens
+        masks = self.flow.prepare_masks(
+            batch["agnostic_mask"],
+            target_latent.shape[-2:],
+            target_latent.dtype,
+            dilation_tokens=dilation,
+        )
+        expanded_mask = torch.nn.functional.interpolate(
+            masks.latent.float(),
+            size=person.shape[-2:],
+            mode="nearest",
+        )
+        person_agnostic_image = batch["person_agnostic"] * (1 - expanded_mask)
+        agnostic_latent = self.encode(person_agnostic_image)
+        agnostic_latent = agnostic_latent * (1 - masks.latent)
+        if garment_latent is None:
+            garment_latent = self.encode(garment)
+        return target, person, person_agnostic_image, target_latent, agnostic_latent, garment_latent, masks
+
+    def _drop_garment(self, garment, garment_mask):
+        if not self.training or self.garment_dropout_prob <= 0:
+            return garment, garment_mask
+        keep = (torch.rand(garment.shape[0], device=garment.device) >= self.garment_dropout_prob).to(
+            garment.dtype
+        )
+        keep_image = keep[:, None, None, None]
+        garment = garment * keep_image
+        if garment_mask is not None:
+            garment_mask = garment_mask * keep_image
+        return garment, garment_mask
+
+    def forward(self, batch):
+        _, _, _, target, person_agnostic, garment, masks = self._encode_batch(batch)
+        edit_mask = batch["agnostic_mask"].float()
+        garment_mask = batch.get("garment_mask")
+        garment, garment_mask = self._drop_garment(garment, garment_mask)
+        xt, ut, timesteps, masks = self.flow.get_interpolants(
+            target,
+            person_agnostic,
+            edit_mask,
+            masks=masks,
+        )
+        label = self._label(batch, target.shape[0], target.device)
+        velocity, logvar = self.model(
+            x=xt,
+            t=timesteps,
+            y=label,
+            person_agnostic=person_agnostic,
+            person_mask=masks.condition,
+            garment=garment,
+            garment_mask=garment_mask,
+            return_uncertainty=True,
+        )
+
+        flow_loss = masked_mean((velocity - ut).square(), masks.latent)
+        outside = 1 - masks.latent
+        outside_loss = masked_mean(velocity.square(), outside)
+        distribution = DiagonalGaussian(mean=velocity.detach(), logvar=logvar)
+        uncertainty_loss = masked_mean(distribution.nll(ut), masks.latent)
+        loss = flow_loss + self.outside_velocity_weight * outside_loss + self.uncertainty_weight * uncertainty_loss
+        return loss, {
+            "flow_loss": flow_loss,
+            "outside_velocity_loss": outside_loss,
+            "sigma_loss": uncertainty_loss,
+            "editable_fraction": masks.latent.mean(),
+        }
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        target_image, person_image, agnostic_image, target, person_agnostic, garment, masks = self._encode_batch(batch)
+        edit_mask = batch["agnostic_mask"].float()
+        garment_mask = batch.get("garment_mask")
+        label = self._label(batch, target.shape[0], target.device)
+        generator = self.generator.manual_seed(batch_idx + self.global_rank * 16102024)
+        noise = torch.randn(target.shape, generator=generator, dtype=target.dtype).to(target.device)
+        sample_model = self.ema_model if exists(self.ema_model) else self.model
+        samples = self.flow.generate(
+            model=sample_model,
+            x=noise,
+            person_agnostic=person_agnostic,
+            edit_mask=edit_mask,
+            garment=garment,
+            garment_mask=garment_mask,
+            y=label,
+            **self.sample_kwargs,
+        )
+        generated = self.decode(samples)
+        expanded = masks.latent
+        expanded = torch.nn.functional.interpolate(expanded, size=target_image.shape[-2:], mode="nearest")
+        composed = compose_vton(generated, person_image, expanded)
+        has_ground_truth = batch.get("has_ground_truth")
+        if self.compute_validation_metrics:
+            if has_ground_truth is None:
+                self.metric_tracker(target_image, composed)
+            elif has_ground_truth.any():
+                self.metric_tracker(target_image[has_ground_truth], composed[has_ground_truth])
+        if self.val_images is None:
+            self.val_images = {
+                "target": un_normalize_ims(target_image[:8]),
+                "person": un_normalize_ims(person_image[:8]),
+                "agnostic": un_normalize_ims(agnostic_image[:8]),
+                "garment": un_normalize_ims(batch["garment"][:8]),
+                "tryon": un_normalize_ims(composed[:8]),
+            }
+
+    def on_validation_epoch_end(self):
+        if self.val_images is not None:
+            for key, images in self.val_images.items():
+                log_images(self.logger, images, f"val/{key}/samples", stack="row", split=4, step=self.global_step)
+            self.val_images = None
+        if self.compute_validation_metrics:
+            metrics = self.metric_tracker.aggregate()
+            for key, value in metrics.items():
+                self.log(f"val/{key}", value, sync_dist=True)
+            self.metric_tracker.reset()
+        self.val_epochs += 1

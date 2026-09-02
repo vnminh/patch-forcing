@@ -183,6 +183,64 @@ The batch should contain a dict with `image`, text (set corresponding text key i
 
 You can use `scripts/t2i_sample.py` to sample images based on a text prompt.
 
+### Virtual Try-On
+
+The VTON extension fine-tunes the released PFT-XL checkpoint with a mask-constrained flow, a zero-initialized agnostic-person condition, and garment cross-attention. The expanded edit mask is applied before VAE encoding, and only the agnostic latent is used as model context; the complete paired image is used only as the supervised target and final RGB reference. It currently uses the native 256x256 PFT latent grid.
+
+Prepare VITON-HD with `image`, `cloth`, `agnostic-mask`, and `cloth-mask` directories under each split, then set the dataset and pretrained checkpoint paths:
+
+```bash
+export VITONHD_ROOT=/path/to/VITON-HD
+export PFT_XL_CKPT=/path/to/pft-xl_step400k_ema.ckpt
+python train.py experiment=viton-pft-xl
+```
+
+The pair files default to `train_pairs.txt` and `test_pairs.txt` at the dataset root. Training and metric validation force paired garments by default; set `paired: false` only for unpaired qualitative evaluation. A dependency and data-pipeline smoke run is available with `data=dummy_vton256`.
+
+Run a fine-tuned checkpoint with:
+
+```bash
+python scripts/vton_sample.py \
+  --ckpt /path/to/vton-training.ckpt \
+  --person person.jpg \
+  --garment garment.jpg \
+  --agnostic-mask person_mask.png \
+  --garment-mask garment_mask.png \
+  --output result.png
+```
+
+Add `--adaptive` after the uncertainty head has been fine-tuned. Pixels outside the expanded edit envelope are composited directly from the input person.
+
+#### Metadata transfer and 16 GB smoke run
+
+Transfer only pair lists and generated agnostic masks to a machine that already contains the original VITON-HD images:
+
+```bash
+bash scripts/transfer_vton_metadata.sh \
+  /local/path/VITON-HD \
+  /remote/path/VITON-HD \
+  azr-ai@100.75.140.87
+```
+
+Set `DRY_RUN=1` to preview the `rsync` file selection. On the remote machine, create a deterministic split with 32 paired training samples and one held-out person evaluated with paired and unpaired garments:
+
+```bash
+python scripts/make_vton_smoke_split.py \
+  --dataset-root /remote/path/VITON-HD \
+  --output-dir /remote/path/VITON-HD/smoke32
+```
+
+Run the low-memory PFT-XL smoke experiment:
+
+```bash
+export VITONHD_ROOT=/remote/path/VITON-HD
+export VITONHD_SMOKE_DIR=/remote/path/VITON-HD/smoke32
+export PFT_XL_CKPT=/remote/path/checkpoints/pft-xl_step400k_ema.ckpt
+python train.py experiment=viton-pft-xl-smoke16gb
+```
+
+This configuration uses batch size 1, four-step gradient accumulation, gradient checkpointing, adapter-only optimization, no EMA copy, eight-step validation sampling, 50 optimizer steps, and no statistical validation metrics. Its validation batch still saves both paired and unpaired try-on images.
+
 
 ## 🎓 Citation
 

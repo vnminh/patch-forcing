@@ -1,0 +1,43 @@
+# @package _global_
+defaults:
+  - override /trainer: vton_patch_flow
+  - override /data: vitonhd_smoke32
+  - override /model: vton-pft-xl
+  - override /autoencoder: sd_ae
+  - override /lr_scheduler: constant
+
+name: vton/pft-xl-smoke16gb
+
+lr_scheduler:
+  params:
+    num_warmup_steps: 5
+
+model:
+  params:
+    gradient_checkpointing: true
+
+trainer:
+  params:
+    ema_rate: 0.0
+    train_adapters_only: true
+    compute_validation_metrics: false
+    sample_kwargs:
+      num_steps: 8
+      cfg_scale: 1.0
+      adaptive: false
+      progress: false
+
+data:
+  params:
+    batch_size: 1
+    val_batch_size: 2
+
+checkpoint_params:
+  every_n_train_steps: 25
+
+train_params:
+  max_steps: 50
+  accumulate_grad_batches: 4
+  limit_val_batches: 1
+  val_check_interval: 10
+  precision: bf16-mixed
