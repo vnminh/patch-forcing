@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import gc
 import hydra
 import torch
 import datetime
@@ -225,7 +226,7 @@ def main(cfg: DictConfig):
     """ Load from checkpoint """
     resume_step = 0
     if exists(cfg.resume_checkpoint):
-        ckpt = torch.load(cfg.resume_checkpoint, map_location=device, weights_only=False)
+        ckpt = torch.load(cfg.resume_checkpoint, map_location="cpu", weights_only=False)
         resume_step = ckpt["global_step"]
         module.load_state_dict(ckpt["state_dict"], strict=cfg.get("load_strict", True))
         assert len(ckpt["optimizer_states"]) == 1, "Checkpoint should only contain one optimizer state dict."
@@ -236,14 +237,20 @@ def main(cfg: DictConfig):
         print(
             f"Rank {accelerator.process_index} ({accelerator.num_processes}): Resumed from checkpoint at step {resume_step}"
         )
+        del ckpt
 
     if exists(cfg.load_weights):
-        ckpt = torch.load(cfg.load_weights, map_location=device, weights_only=False)
+        ckpt = torch.load(cfg.load_weights, map_location="cpu", weights_only=False)
         module.load_state_dict(ckpt["state_dict"], strict=cfg.get("load_strict", True))
         print(f"Rank {accelerator.process_index} ({accelerator.num_processes}): Loaded weights from {cfg.load_weights}")
         if "resume_step" in cfg and cfg.resume_step > 0:
             resume_step = cfg.resume_step
             print(f"Rank {accelerator.process_index} ({accelerator.num_processes}): Set resume step to {resume_step}")
+        del ckpt
+
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     """ Setup DDP """
     module, optimizer, train_loader, val_loader = accelerator.prepare(module, optimizer, train_loader, val_loader)
