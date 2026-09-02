@@ -28,13 +28,13 @@ Person Ip ---> supplied agnostic mask M ---> token dilation
           ---> expanded RGB mask M+ ---> remove garment before VAE
           ---> frozen VAE encoder -------------------------------> agnostic latent za
 
-Garment Ig ---> frozen VAE encoder ------------------------------> garment latent zg
+Garment Ig ---> offline frozen DINOv2-small ---------------------> garment feature map fg
 Garment mask Mg -------------------------------------------------> garment token key mask
 
 Noise epsilon + z* + za + token times --------------------------> evolving latent xt
 
 [xt, za, interpolated mask] ---> zero-initialized input extension
-zg + Mg ----------------------> zero-initialized garment cross-attention
+fg + Mg ----------------------> garment cross-attention
 per-token time ---------------> per-token AdaLN modulation
                                      |
                               pretrained PFT-XL
@@ -198,7 +198,11 @@ If a rare draw produces \(t_i<0\), it is replaced by a uniform sample in \([0,\b
 
 Consequently, editable tokens have heterogeneous times but no editable token is cleaner than the sampled ceiling \(\bar t\). This is the LTG principle used by PFT to prevent the network from routinely seeing unrealistically clean generated patches during training.
 
-### 6.3 Known context versus generated tokens
+### 6.3 Garment-forcing samples
+
+With probability 0.3 per training example, every editable token time is overridden to zero. Its editable state is therefore pure noise, forcing prediction to use the person context and DINO garment condition instead of reading partially clean paired-target pixels from the flow state. The remaining 70% of examples retain heterogeneous PFT token times.
+
+### 6.4 Known context versus generated tokens
 
 After sampling, token times are overridden according to the edit mask:
 
@@ -283,13 +287,7 @@ Inside the hard editable region, the explicit agnostic latent is zero. Pose and 
 
 ## 10. Garment conditioning
 
-The garment image is encoded by the same frozen SD VAE:
-
-\[
-z_g=E(I_g).
-\]
-
-Its latent patches are embedded using a four-channel garment patch embedder initialized from the pretrained PFT input projection. Garment background tokens are suppressed using the resized garment foreground mask \(M_g\).
+Garment images are encoded once, offline, with frozen DINOv2-small at 448 by 336. The resulting 32-by-24 FP16 feature map is cached on disk. Training loads only this map; DINO itself and its activations are never placed on the training GPU. A learned projection maps the 384-channel DINO features into the PFT hidden dimension. Garment background tokens are suppressed using the resized garment foreground mask \(M_g\).
 
 Every fourth transformer block contains garment cross-attention:
 
@@ -307,9 +305,9 @@ The cross-attention residual is multiplied by the editable query mask, so garmen
 
 Cross-attention is inserted after self-attention and before the MLP in blocks 4, 8, 12, 16, 20, 24, and 28.
 
-The cross-attention output projection is initialized to zero. Therefore garment cross-attention also leaves the pretrained PFT function unchanged initially. Its output projection learns first; gradients then begin training the upstream garment projections and attention alignment.
+The cross-attention output projection is initialized to zero, while the DINO projection has a small nonzero Xavier initialization. Therefore garment cross-attention leaves pretrained PFT unchanged initially, but its output projection receives gradients immediately.
 
-The interpolated garment mask does not replace garment features. It only determines which garment tokens are valid keys and values. Appearance still comes from learned garment latent tokens.
+The interpolated garment mask does not replace garment features. It only determines which DINO garment tokens are valid keys and values.
 
 ## 11. Class and garment-free conditioning
 
@@ -455,7 +453,7 @@ Self-attention can use clean face, hair, body boundary, pose, and background tok
 - \(x_t\) represents the current generated state.
 - \(z_a\) represents person identity and spatial context without the old garment.
 - the soft mask identifies the editable boundary.
-- \(z_g\) represents garment appearance.
+- \(f_g\) represents semantic and high-frequency garment appearance.
 - \(M_g\) removes irrelevant garment background keys.
 - per-token time tells the model how reliable each spatial token currently is.
 
@@ -482,10 +480,10 @@ This mode is intended to validate data flow, checkpoint transfer, gradients, los
 
 ## 17. Important limitations
 
-1. The current pretrained grid is fixed at \(256\times256\). Rectangular or higher-resolution training requires positional and unpatchification changes.
+1. PFT-XL was pretrained on a square grid. The implementation supports 512-by-384 fine-tuning through positional interpolation, but this remains resolution transfer rather than native rectangular pretraining.
 2. One token equals roughly 16 input pixels. This handles small parsing errors but not large category topology changes by itself.
 3. The implementation has no DensePose or explicit pose encoder. It relies on agnostic spatial context and visible body boundaries.
-4. Garment appearance is encoded in SD-VAE space. Extremely small text or texture may require a higher-resolution garment feature path later.
+4. DINO features preserve semantic patterns and logos better than SD-VAE latents, but exact readable text is still not guaranteed without a dedicated text/detail loss.
 5. Adaptive uncertainty is meaningful only after the head has been trained on the VTON distribution.
 6. Unpaired validation has no pixel-aligned ground truth. It should be judged qualitatively or with garment/person-specific metrics, not SSIM against the input person.
 

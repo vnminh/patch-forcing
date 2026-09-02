@@ -218,6 +218,55 @@ class VTONTests(unittest.TestCase):
             agnostic.masked_select(~masks.latent.bool()),
         )
 
+    def test_zero_time_forcing_uses_pure_noise_in_edit_region(self):
+        flow = VTONPatchFlowForcing(
+            patch_size=2,
+            mask_dilation_tokens=0,
+            zero_time_probability=1.0,
+        )
+        target = torch.randn(2, 4, 8, 8)
+        context = torch.randn_like(target)
+        noise = torch.randn_like(target)
+        mask = torch.zeros(2, 1, 8, 8)
+        mask[:, :, 2:6, 2:6] = 1
+        xt, _, timesteps, masks = flow.get_interpolants(target, context, mask, x0=noise)
+        self.assertTrue(torch.all(timesteps.masked_select(masks.token) == 0))
+        torch.testing.assert_close(xt.masked_select(masks.latent.bool()), noise.masked_select(masks.latent.bool()))
+
+    def test_dino_garment_projection_receives_gradients(self):
+        model = VTONPatchForcingDiT(
+            input_size=8,
+            patch_size=2,
+            in_channels=4,
+            hidden_size=64,
+            depth=1,
+            num_heads=4,
+            num_classes=10,
+            predict_uncertainty=True,
+            garment_feature_dim=32,
+            use_vae_garment=False,
+            cross_attention_every=1,
+            compile=False,
+        ).train()
+        with torch.no_grad():
+            model.final_layer.linear.weight.normal_(std=0.01)
+            model.blocks[0].garment_cross_attention.out_proj.weight.normal_(std=0.01)
+        latent = torch.randn(1, 4, 8, 8)
+        mask = torch.ones(1, 1, 8, 8)
+        output = model(
+            latent,
+            torch.rand(1, 16),
+            torch.zeros(1, dtype=torch.long),
+            person_agnostic=torch.randn_like(latent),
+            person_mask=mask,
+            edit_mask=mask,
+            garment=torch.randn_like(latent),
+            garment_mask=mask,
+            garment_features=torch.randn(1, 32, 5, 4),
+        )
+        output.square().mean().backward()
+        self.assertGreater(model.garment_feature_proj.weight.grad.abs().sum().item(), 0)
+
     def test_one_token_dilation(self):
         mask = torch.zeros(1, 1, 16, 16)
         mask[:, :, 4:8, 4:8] = 1

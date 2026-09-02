@@ -81,6 +81,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         target = batch["image"]
         person = batch.get("person", target)
         garment = batch["garment"]
+        garment_features = batch.get("garment_dino")
         target_latent = batch.get("latent")
         garment_latent = batch.get("garment_latent")
         if target_latent is None:
@@ -102,8 +103,13 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         agnostic_latent = self.encode(person_agnostic_image)
         person_condition = agnostic_latent * (1 - remove_masks.latent)
         person_context = agnostic_latent * (1 - edit_masks.latent)
-        if garment_latent is None:
+        use_vae_garment = getattr(self.model, "use_vae_garment", True)
+        if garment_features is None and not use_vae_garment:
+            raise ValueError("DINO garment features are required when use_vae_garment=false")
+        if garment_latent is None and use_vae_garment:
             garment_latent = self.encode(garment)
+        if not use_vae_garment:
+            garment_latent = None
         return (
             target,
             person,
@@ -112,27 +118,43 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             person_context,
             person_condition,
             garment_latent,
+            garment_features,
             edit_masks,
             remove_masks,
         )
 
-    def _drop_garment(self, garment, garment_mask):
+    def _drop_garment(self, garment, garment_mask, garment_features=None):
         if not self.training or self.garment_dropout_prob <= 0:
-            return garment, garment_mask
-        keep = (torch.rand(garment.shape[0], device=garment.device) >= self.garment_dropout_prob).to(
-            garment.dtype
+            return garment, garment_mask, garment_features
+        condition = garment_features if garment_features is not None else garment
+        keep = (torch.rand(condition.shape[0], device=condition.device) >= self.garment_dropout_prob).to(
+            condition.dtype
         )
         keep_image = keep[:, None, None, None]
-        garment = garment * keep_image
+        if garment is not None:
+            garment = garment * keep_image
         if garment_mask is not None:
             garment_mask = garment_mask * keep_image
-        return garment, garment_mask
+        if garment_features is not None:
+            garment_features = garment_features * keep_image
+        return garment, garment_mask, garment_features
 
     def forward(self, batch):
-        _, _, _, target, person_context, person_condition, garment, edit_masks, remove_masks = self._encode_batch(batch)
+        (
+            _,
+            _,
+            _,
+            target,
+            person_context,
+            person_condition,
+            garment,
+            garment_features,
+            edit_masks,
+            remove_masks,
+        ) = self._encode_batch(batch)
         edit_mask = batch["agnostic_mask"].float()
         garment_mask = batch.get("garment_mask")
-        garment, garment_mask = self._drop_garment(garment, garment_mask)
+        garment, garment_mask, garment_features = self._drop_garment(garment, garment_mask, garment_features)
         xt, ut, timesteps, masks = self.flow.get_interpolants(
             target,
             person_context,
@@ -149,6 +171,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             edit_mask=edit_masks.condition,
             garment=garment,
             garment_mask=garment_mask,
+            garment_features=garment_features,
             return_uncertainty=True,
         )
 
@@ -164,6 +187,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             "sigma_loss": uncertainty_loss,
             "editable_fraction": edit_masks.latent.mean(),
             "outside_fraction": outside.mean(),
+            "zero_time_fraction": ((timesteps == 0) & edit_masks.token).float().sum()
+            / edit_masks.token.float().sum().clamp_min(1),
         }
 
     @torch.no_grad()
@@ -176,6 +201,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             person_context,
             person_condition,
             garment,
+            garment_features,
             edit_masks,
             remove_masks,
         ) = self._encode_batch(batch)
@@ -194,6 +220,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             edit_mask=edit_mask,
             garment=garment,
             garment_mask=garment_mask,
+            garment_features=garment_features,
             y=label,
             **self.sample_kwargs,
         )

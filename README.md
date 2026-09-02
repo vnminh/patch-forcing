@@ -265,6 +265,20 @@ python train.py experiment=viton-pft-xl-smoke16gb \
 
 `max_steps` and `val_check_interval` count optimizer updates. With `accumulate_grad_batches=4`, one optimizer update consumes four mini-batches.
 
+For DINO-only 512-by-384 training, precompute frozen DINOv2-small garment maps once:
+
+```bash
+export VITONHD_ROOT=/path/to/VITON-HD
+export VITONHD_DINO_DIR=/path/to/vitonhd-dino
+
+python scripts/precompute_dino_garments.py \
+  --dataset-root "$VITONHD_ROOT" --output-dir "$VITONHD_DINO_DIR" --split train
+python scripts/precompute_dino_garments.py \
+  --dataset-root "$VITONHD_ROOT" --output-dir "$VITONHD_DINO_DIR" --split test
+```
+
+The cached FP16 maps use a 32-by-24 DINO token grid. DINO is not loaded during training, and the garment is not encoded by the VAE. Set `VITONHD_DINO_DIR` before running `experiment=viton-pft-xl-512x384`.
+
 
 ## 🎓 Citation
 

@@ -8,6 +8,7 @@ params:
   num_heads: 16
   num_classes: 1000
   predict_uncertainty: true
+  garment_feature_dim: null
+  use_vae_garment: true
   cross_attention_every: 4
   pretrained_ckpt: ${oc.env:PFT_XL_CKPT,null}
-

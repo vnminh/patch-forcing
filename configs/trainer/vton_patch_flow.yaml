@@ -8,6 +8,7 @@ params:
       patch_size: 2
       mask_dilation_tokens: 1
       mask_dilation_jitter_tokens: 0
+      zero_time_probability: 0.3
       timestep_sampler:
         target: patch_flow.timestep_schedules.LogitNormalTruncatedGaussian
         params:

@@ -52,12 +52,18 @@ class VTONHDDataset(Dataset):
         random_flip=False,
         paired=True,
         preview_sample_id=None,
+        dino_feature_dir=None,
     ):
         self.root = os.path.abspath(root)
         self.split = split
         self.image_size = _image_size(image_size)
         self.random_flip = bool(random_flip)
         self.paired = bool(paired)
+        self.dino_feature_dir = None
+        if dino_feature_dir is not None:
+            feature_root = os.path.abspath(dino_feature_dir)
+            split_feature_root = os.path.join(feature_root, split)
+            self.dino_feature_dir = split_feature_root if os.path.isdir(split_feature_root) else feature_root
         split_root = os.path.join(self.root, split)
         self.image_dir = os.path.join(split_root, "image")
         self.garment_dir = os.path.join(split_root, "cloth")
@@ -91,6 +97,20 @@ class VTONHDDataset(Dataset):
         image = Image.open(path).convert("L")
         return _letterbox(image, self.image_size, 0, Image.Resampling.NEAREST)
 
+    def _load_dino_features(self, filename):
+        if self.dino_feature_dir is None:
+            return None
+        stem, _ = os.path.splitext(filename)
+        path = os.path.join(self.dino_feature_dir, f"{stem}.pt")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"DINO garment feature not found: {path}")
+        features = torch.load(path, map_location="cpu", weights_only=True)
+        if isinstance(features, dict):
+            features = features["features"]
+        if not isinstance(features, torch.Tensor) or features.ndim != 3:
+            raise ValueError(f"Expected DINO features (C,H,W) in {path}")
+        return features
+
     def __getitem__(self, index):
         person_name, garment_name = self.pairs[index]
         if self.paired:
@@ -99,18 +119,22 @@ class VTONHDDataset(Dataset):
         garment = self._load_rgb(_resolve_file(self.garment_dir, garment_name))
         agnostic_mask = self._load_mask(_resolve_file(self.agnostic_mask_dir, person_name, mask=True))
         garment_mask = self._load_mask(_resolve_file(self.garment_mask_dir, garment_name, mask=True))
-        if self.random_flip and random.random() < 0.5:
+        garment_dino = self._load_dino_features(garment_name)
+        flipped = self.random_flip and random.random() < 0.5
+        if flipped:
             person = TF.hflip(person)
             garment = TF.hflip(garment)
             agnostic_mask = TF.hflip(agnostic_mask)
             garment_mask = TF.hflip(garment_mask)
+            if garment_dino is not None:
+                garment_dino = garment_dino.flip(-1)
 
         person = TF.to_tensor(person) * 2 - 1
         garment = TF.to_tensor(garment) * 2 - 1
         agnostic_mask = (TF.to_tensor(agnostic_mask) > 0.5).float()
         garment_mask = (TF.to_tensor(garment_mask) > 0.5).float()
         person_agnostic = person * (1 - agnostic_mask)
-        return {
+        sample = {
             "image": person.clone(),
             "person": person,
             "person_agnostic": person_agnostic,
@@ -121,6 +145,9 @@ class VTONHDDataset(Dataset):
             "person_name": person_name,
             "garment_name": garment_name,
         }
+        if garment_dino is not None:
+            sample["garment_dino"] = garment_dino
+        return sample
 
 
 class DummyVTONDataset(Dataset):

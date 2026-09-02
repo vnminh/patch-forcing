@@ -13,10 +13,14 @@ class VTONPatchFlowForcing:
         patch_size=2,
         mask_dilation_tokens=1,
         mask_dilation_jitter_tokens=0,
+        zero_time_probability=0.0,
     ):
         self.patch_size = int(patch_size)
         self.mask_dilation_tokens = int(mask_dilation_tokens)
         self.mask_dilation_jitter_tokens = int(mask_dilation_jitter_tokens)
+        self.zero_time_probability = float(zero_time_probability)
+        if not 0 <= self.zero_time_probability <= 1:
+            raise ValueError("zero_time_probability must be in [0, 1]")
         self.t_sampler = torch.rand if timestep_sampler is None else instantiate_from_config(timestep_sampler)
 
     def sample_training_dilation(self):
@@ -54,6 +58,9 @@ class VTONPatchFlowForcing:
         tokens = (height // self.patch_size) * (width // self.patch_size)
         if t is None:
             t = self.t_sampler((batch, tokens), device=x1.device, dtype=x1.dtype)
+            if self.zero_time_probability > 0:
+                force_zero = torch.rand((batch, 1), device=x1.device) < self.zero_time_probability
+                t = torch.where(force_zero, torch.zeros_like(t), t)
         if t.shape != (batch, tokens):
             raise ValueError(f"Expected timestep shape {(batch, tokens)}, got {tuple(t.shape)}")
         t_effective = torch.where(masks.token, t, torch.ones_like(t))
@@ -80,6 +87,7 @@ class VTONPatchFlowForcing:
         edit_condition_mask,
         garment,
         garment_mask,
+        garment_features,
         y,
         cfg_scale,
         return_uncertainty,
@@ -90,10 +98,11 @@ class VTONPatchFlowForcing:
             edit_mask=edit_condition_mask,
             garment=garment,
             garment_mask=garment_mask,
+            garment_features=garment_features,
             y=y,
             return_uncertainty=return_uncertainty,
         )
-        if cfg_scale == 1.0 or garment is None:
+        if cfg_scale == 1.0 or (garment is None and garment_features is None):
             return model(x=x, t=t, **kwargs)
 
         batch = x.shape[0]
@@ -103,7 +112,10 @@ class VTONPatchFlowForcing:
         kwargs["person_mask"] = self._repeat_condition(person_condition_mask, 2)
         kwargs["edit_mask"] = self._repeat_condition(edit_condition_mask, 2)
         kwargs["y"] = self._repeat_condition(y, 2)
-        kwargs["garment"] = torch.cat((torch.zeros_like(garment), garment), dim=0)
+        if garment is not None:
+            kwargs["garment"] = torch.cat((torch.zeros_like(garment), garment), dim=0)
+        if garment_features is not None:
+            kwargs["garment_features"] = torch.cat((torch.zeros_like(garment_features), garment_features), dim=0)
         if garment_mask is not None:
             kwargs["garment_mask"] = torch.cat((torch.zeros_like(garment_mask), garment_mask), dim=0)
         output = model(x=x_in, t=t_in, **kwargs)
@@ -143,6 +155,7 @@ class VTONPatchFlowForcing:
         edit_mask,
         garment,
         garment_mask=None,
+        garment_features=None,
         person_condition=None,
         person_condition_mask=None,
         y=None,
@@ -189,6 +202,7 @@ class VTONPatchFlowForcing:
                 masks.condition,
                 garment,
                 garment_mask,
+                garment_features,
                 y,
                 cfg_scale,
                 return_uncertainty=adaptive,
@@ -219,6 +233,7 @@ class VTONPatchFlowForcing:
                         masks.condition,
                         garment,
                         garment_mask,
+                        garment_features,
                         y,
                         cfg_scale,
                         return_uncertainty=False,

@@ -38,6 +38,15 @@ def config_without_pretrained(config):
     return config
 
 
+def load_dino_features(path):
+    features = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(features, dict):
+        features = features["features"]
+    if not isinstance(features, torch.Tensor) or features.ndim != 3:
+        raise ValueError(f"Expected DINO features (C,H,W) in {path}")
+    return features[None]
+
+
 def main(args):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for PFT-XL inference")
@@ -58,6 +67,7 @@ def main(args):
     garment_image = load_rgb(args.garment, image_size).to(device)
     edit_mask = load_mask(args.agnostic_mask, image_size).to(device)
     garment_mask = load_mask(args.garment_mask, image_size).to(device) if args.garment_mask else None
+    garment_features = load_dino_features(args.garment_dino).to(device) if args.garment_dino else None
     person_agnostic_image = person_image * (1 - edit_mask)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         agnostic_latent = autoencoder.encode(person_agnostic_image)
@@ -70,7 +80,10 @@ def main(args):
         )
         person_condition = agnostic_latent * (1 - remove_masks.latent)
         person_context = agnostic_latent * (1 - edit_masks.latent)
-        garment = autoencoder.encode(garment_image)
+        use_vae_garment = getattr(model, "use_vae_garment", True)
+        if garment_features is None and not use_vae_garment:
+            raise ValueError("--garment-dino is required by this DINO-only checkpoint")
+        garment = autoencoder.encode(garment_image) if use_vae_garment else None
         generator = torch.Generator(device=device).manual_seed(args.seed)
         noise = torch.randn(
             person_context.shape,
@@ -88,6 +101,7 @@ def main(args):
             edit_mask=edit_mask,
             garment=garment,
             garment_mask=garment_mask,
+            garment_features=garment_features,
             y=label,
             num_steps=args.steps,
             cfg_scale=args.cfg_scale,
@@ -111,6 +125,7 @@ if __name__ == "__main__":
     parser.add_argument("--garment", required=True)
     parser.add_argument("--agnostic-mask", required=True)
     parser.add_argument("--garment-mask")
+    parser.add_argument("--garment-dino")
     parser.add_argument("--output", default="vton_result.png")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--height", type=int)

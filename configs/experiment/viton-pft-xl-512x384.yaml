@@ -11,6 +11,8 @@ name: vton/pft-xl-512x384
 model:
   params:
     gradient_checkpointing: true
+    garment_feature_dim: 384
+    use_vae_garment: false
 
 data:
   params:

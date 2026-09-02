@@ -59,6 +59,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         self,
         *args,
         person_condition_channels=5,
+        garment_feature_dim=None,
+        use_vae_garment=True,
         cross_attention_every=4,
         gradient_checkpointing=False,
         pretrained_ckpt=None,
@@ -79,6 +81,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         patch_size = old_embedder.patch_size[0]
         self.state_channels = self.in_channels
         self.person_condition_channels = person_condition_channels
+        self.garment_feature_dim = None if garment_feature_dim is None else int(garment_feature_dim)
+        self.use_vae_garment = bool(use_vae_garment)
         self.cross_attention_every = cross_attention_every
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.x_embedder = PatchEmbed(
@@ -89,20 +93,31 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             bias=True,
             strict_img_size=False,
         )
-        self.garment_embedder = PatchEmbed(
-            input_size,
-            patch_size,
-            self.state_channels,
-            self.hidden_size,
-            bias=True,
-            strict_img_size=False,
-        )
+        self.garment_embedder = None
+        if self.use_vae_garment:
+            self.garment_embedder = PatchEmbed(
+                input_size,
+                patch_size,
+                self.state_channels,
+                self.hidden_size,
+                bias=True,
+                strict_img_size=False,
+            )
+        if self.garment_feature_dim is not None:
+            self.garment_feature_norm = nn.LayerNorm(self.garment_feature_dim)
+            self.garment_feature_proj = nn.Linear(self.garment_feature_dim, self.hidden_size, bias=True)
+            nn.init.xavier_uniform_(self.garment_feature_proj.weight, gain=0.1)
+            nn.init.zeros_(self.garment_feature_proj.bias)
+        else:
+            self.garment_feature_norm = None
+            self.garment_feature_proj = None
         with torch.no_grad():
             self.x_embedder.proj.weight.zero_()
             self.x_embedder.proj.weight[:, : self.state_channels].copy_(old_embedder.proj.weight)
             self.x_embedder.proj.bias.copy_(old_embedder.proj.bias)
-            self.garment_embedder.proj.weight.copy_(old_embedder.proj.weight)
-            self.garment_embedder.proj.bias.copy_(old_embedder.proj.bias)
+            if self.garment_embedder is not None:
+                self.garment_embedder.proj.weight.copy_(old_embedder.proj.weight)
+                self.garment_embedder.proj.bias.copy_(old_embedder.proj.bias)
 
         old_blocks = self.blocks
         self.blocks = nn.ModuleList()
@@ -148,11 +163,13 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 raise ValueError(f"Expected {self.state_channels} pretrained input channels, got {base_weight.shape[1]}")
             current[weight_key].zero_()
             current[weight_key][:, : self.state_channels] = base_weight
-            current["garment_embedder.proj.weight"] = base_weight.clone()
+            if self.garment_embedder is not None:
+                current["garment_embedder.proj.weight"] = base_weight.clone()
             loaded.add(weight_key)
         if bias_key in pretrained_state:
             current[bias_key] = pretrained_state[bias_key]
-            current["garment_embedder.proj.bias"] = pretrained_state[bias_key].clone()
+            if self.garment_embedder is not None:
+                current["garment_embedder.proj.bias"] = pretrained_state[bias_key].clone()
             loaded.add(bias_key)
 
         ignored = {key for key in pretrained_state if key not in loaded}
@@ -203,6 +220,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         edit_mask=None,
         garment=None,
         garment_mask=None,
+        garment_features=None,
         return_uncertainty=False,
     ):
         batch, _, height, width = x.shape
@@ -228,9 +246,30 @@ class VTONPatchForcingDiT(PatchForcingDiT):
 
         garment_tokens = None
         garment_padding_mask = None
-        if garment is not None:
+        if garment is not None and self.garment_embedder is not None:
             garment = F.interpolate(garment, size=(height, width), mode="bilinear", align_corners=False)
             garment_tokens = self.garment_embedder(garment) + position
+        if garment_features is not None:
+            if self.garment_feature_proj is None:
+                raise ValueError("garment_feature_dim must be configured when garment_features are provided")
+            if garment_features.ndim != 4 or garment_features.shape[1] != self.garment_feature_dim:
+                raise ValueError(
+                    f"Expected garment features (B,{self.garment_feature_dim},H,W), "
+                    f"got {tuple(garment_features.shape)}"
+                )
+            token_height = height // self.patch_size
+            token_width = width // self.patch_size
+            garment_features = F.interpolate(
+                garment_features,
+                size=(token_height, token_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            garment_features = garment_features.flatten(2).transpose(1, 2)
+            garment_features = self.garment_feature_norm(garment_features)
+            dino_tokens = self.garment_feature_proj(garment_features).to(x.dtype)
+            garment_tokens = dino_tokens if garment_tokens is None else garment_tokens + dino_tokens
+        if garment_tokens is not None:
             garment_keep = self._token_mask(garment_mask, (height, width))
             if garment_keep is not None:
                 empty = ~garment_keep.any(dim=1)
