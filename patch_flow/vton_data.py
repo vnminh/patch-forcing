@@ -7,13 +7,25 @@ from torch.utils.data import Dataset
 from torchvision.transforms import functional as TF
 
 
+def _image_size(size):
+    if isinstance(size, int):
+        return size, size
+    if len(size) != 2:
+        raise ValueError("image_size must be an integer or [height, width]")
+    height, width = (int(value) for value in size)
+    if height < 1 or width < 1:
+        raise ValueError("image dimensions must be positive")
+    return height, width
+
+
 def _letterbox(image, size, fill, interpolation):
+    target_height, target_width = _image_size(size)
     width, height = image.size
-    scale = min(size / width, size / height)
+    scale = min(target_width / width, target_height / height)
     resized = image.resize((round(width * scale), round(height * scale)), interpolation)
-    canvas = Image.new(image.mode, (size, size), fill)
-    left = (size - resized.width) // 2
-    top = (size - resized.height) // 2
+    canvas = Image.new(image.mode, (target_width, target_height), fill)
+    left = (target_width - resized.width) // 2
+    top = (target_height - resized.height) // 2
     canvas.paste(resized, (left, top))
     return canvas
 
@@ -31,10 +43,19 @@ def _resolve_file(directory, filename, mask=False):
 
 
 class VTONHDDataset(Dataset):
-    def __init__(self, root, split="train", pair_list=None, image_size=256, random_flip=False, paired=True):
+    def __init__(
+        self,
+        root,
+        split="train",
+        pair_list=None,
+        image_size=256,
+        random_flip=False,
+        paired=True,
+        preview_sample_id=None,
+    ):
         self.root = os.path.abspath(root)
         self.split = split
-        self.image_size = int(image_size)
+        self.image_size = _image_size(image_size)
         self.random_flip = bool(random_flip)
         self.paired = bool(paired)
         split_root = os.path.join(self.root, split)
@@ -49,6 +70,15 @@ class VTONHDDataset(Dataset):
             self.pairs = [tuple(line.split()[:2]) for line in handle if line.strip()]
         if not self.pairs:
             raise ValueError(f"Pair list is empty: {pair_list}")
+        if preview_sample_id is not None:
+            preview_sample_id = str(preview_sample_id)
+            preview_index = next(
+                (index for index, (person_name, _) in enumerate(self.pairs) if person_name == preview_sample_id),
+                None,
+            )
+            if preview_index is None:
+                raise ValueError(f"Preview sample '{preview_sample_id}' is not present in {pair_list}")
+            self.pairs.insert(0, self.pairs.pop(preview_index))
 
     def __len__(self):
         return len(self.pairs)
@@ -96,18 +126,18 @@ class VTONHDDataset(Dataset):
 class DummyVTONDataset(Dataset):
     def __init__(self, num_samples=1024, image_size=256):
         self.num_samples = int(num_samples)
-        self.image_size = int(image_size)
+        self.image_size = _image_size(image_size)
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, index):
         generator = torch.Generator().manual_seed(index)
-        size = self.image_size
-        person = torch.rand((3, size, size), generator=generator) * 2 - 1
-        garment = torch.rand((3, size, size), generator=generator) * 2 - 1
-        mask = torch.zeros((1, size, size))
-        mask[:, size // 4 : 3 * size // 4, size // 4 : 3 * size // 4] = 1
+        height, width = self.image_size
+        person = torch.rand((3, height, width), generator=generator) * 2 - 1
+        garment = torch.rand((3, height, width), generator=generator) * 2 - 1
+        mask = torch.zeros((1, height, width))
+        mask[:, height // 4 : 3 * height // 4, width // 4 : 3 * width // 4] = 1
         garment_mask = mask.clone()
         return {
             "image": person.clone(),

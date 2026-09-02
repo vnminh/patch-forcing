@@ -70,7 +70,11 @@ The token mask is morphologically dilated:
 M_T^+ = \operatorname{Dilate}(M_T, r).
 \]
 
-The normal configuration applies no additional token-grid dilation because max-pooling already rounds the supplied mask outward to complete PFT tokens. During training, zero or one extra token is sampled as robustness jitter. Validation and inference use only the max-pooled token envelope. This preserves more clean outside-person context than the earlier one- or two-token expansion.
+Max-pooling first rounds the supplied mask outward to complete PFT tokens. The edit/time path then applies one additional token of dilation without random jitter. The person-conditioning path uses the undilated token envelope, preventing the edit expansion from erasing nearby identity evidence.
+
+The split-mask configuration keeps the RGB agnostic condition masked only by the original removal mask. A separate edit mask receives one token of dilation and controls sampled times, noise, loss, sampler updates, garment-attention queries, and final compositing. The encoded person condition is cleared only under the undilated token mask, while the fixed flow context is cleared under the expanded edit mask. Identity evidence in the expansion ring therefore remains available as conditioning without being copied into the evolving state.
+
+For 512-by-384 training, the VAE produces a 64-by-48 latent and PFT uses a 32-by-24 token grid. PFT-XL's pretrained convolutional patch projection transfers directly. Its frozen 16-by-16 positional embedding is bicubically interpolated to the rectangular grid, so rectangular training fine-tunes from the square pretrained model without changing checkpoint parameter shapes.
 
 With the current SD VAE downsampling factor of 8 and PFT patch size 2, one PFT token covers approximately \(16\times16\) input pixels.
 

@@ -1,0 +1,25 @@
+# @package _global_
+defaults:
+  - override /trainer: vton_patch_flow
+  - override /data: vitonhd512x384
+  - override /model: vton-pft-xl
+  - override /autoencoder: sd_ae
+  - override /lr_scheduler: constant
+
+name: vton/pft-xl-512x384
+
+model:
+  params:
+    gradient_checkpointing: true
+
+data:
+  params:
+    batch_size: 1
+    val_batch_size: 1
+
+train_params:
+  max_steps: 100000
+  accumulate_grad_batches: 4
+  limit_val_batches: 32
+  val_check_interval: 5000
+  precision: bf16-mixed

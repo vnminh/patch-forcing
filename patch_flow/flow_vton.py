@@ -11,7 +11,7 @@ class VTONPatchFlowForcing:
         self,
         timestep_sampler=None,
         patch_size=2,
-        mask_dilation_tokens=0,
+        mask_dilation_tokens=1,
         mask_dilation_jitter_tokens=0,
     ):
         self.patch_size = int(patch_size)
@@ -36,10 +36,10 @@ class VTONPatchFlowForcing:
         masks.latent = masks.latent.to(dtype)
         return masks
 
-    def get_interpolants(self, x1, person_agnostic, edit_mask, x0=None, t=None, masks=None):
-        if x1.shape != person_agnostic.shape:
+    def get_interpolants(self, x1, person_context, edit_mask, x0=None, t=None, masks=None):
+        if x1.shape != person_context.shape:
             raise ValueError(
-                f"Target and agnostic latents must match, got {x1.shape} and {person_agnostic.shape}"
+                f"Target and context latents must match, got {x1.shape} and {person_context.shape}"
             )
         if x0 is None:
             x0 = torch.randn_like(x1)
@@ -60,7 +60,7 @@ class VTONPatchFlowForcing:
         t_latent = t_effective.view(batch, 1, height // self.patch_size, width // self.patch_size)
         t_latent = t_latent.repeat_interleave(self.patch_size, -2).repeat_interleave(self.patch_size, -1)
         interpolated = t_latent * x1 + (1 - t_latent) * x0
-        xt = masks.latent * interpolated + (1 - masks.latent) * person_agnostic
+        xt = masks.latent * interpolated + (1 - masks.latent) * person_context
         ut = x1 - x0
         return xt, ut, t_effective, masks
 
@@ -75,8 +75,9 @@ class VTONPatchFlowForcing:
         model,
         x,
         t,
-        person_agnostic,
-        person_mask,
+        person_condition,
+        person_condition_mask,
+        edit_condition_mask,
         garment,
         garment_mask,
         y,
@@ -84,8 +85,9 @@ class VTONPatchFlowForcing:
         return_uncertainty,
     ):
         kwargs = dict(
-            person_agnostic=person_agnostic,
-            person_mask=person_mask,
+            person_agnostic=person_condition,
+            person_mask=person_condition_mask,
+            edit_mask=edit_condition_mask,
             garment=garment,
             garment_mask=garment_mask,
             y=y,
@@ -97,8 +99,9 @@ class VTONPatchFlowForcing:
         batch = x.shape[0]
         x_in = torch.cat((x, x), dim=0)
         t_in = torch.cat((t, t), dim=0)
-        kwargs["person_agnostic"] = self._repeat_condition(person_agnostic, 2)
-        kwargs["person_mask"] = self._repeat_condition(person_mask, 2)
+        kwargs["person_agnostic"] = self._repeat_condition(person_condition, 2)
+        kwargs["person_mask"] = self._repeat_condition(person_condition_mask, 2)
+        kwargs["edit_mask"] = self._repeat_condition(edit_condition_mask, 2)
         kwargs["y"] = self._repeat_condition(y, 2)
         kwargs["garment"] = torch.cat((torch.zeros_like(garment), garment), dim=0)
         if garment_mask is not None:
@@ -140,6 +143,8 @@ class VTONPatchFlowForcing:
         edit_mask,
         garment,
         garment_mask=None,
+        person_condition=None,
+        person_condition_mask=None,
         y=None,
         num_steps=50,
         cfg_scale=1.0,
@@ -156,8 +161,12 @@ class VTONPatchFlowForcing:
             raise ValueError("Adaptive sampling requires at least two inner steps")
         masks = self.prepare_masks(edit_mask, person_agnostic.shape[-2:], person_agnostic.dtype)
         batch, _, height, width = person_agnostic.shape
-        xt = masks.latent * x + (1 - masks.latent) * person_agnostic
-        person_agnostic = person_agnostic * (1 - masks.latent)
+        person_context = person_agnostic * (1 - masks.latent)
+        if person_condition is None:
+            person_condition = person_context
+        if person_condition_mask is None:
+            person_condition_mask = masks.condition
+        xt = masks.latent * x + (1 - masks.latent) * person_context
         token_times = torch.where(
             masks.token,
             torch.zeros_like(masks.token, dtype=x.dtype),
@@ -175,7 +184,8 @@ class VTONPatchFlowForcing:
                 model,
                 xt,
                 token_times,
-                person_agnostic,
+                person_condition,
+                person_condition_mask,
                 masks.condition,
                 garment,
                 garment_mask,
@@ -204,7 +214,8 @@ class VTONPatchFlowForcing:
                         model,
                         xt,
                         token_times,
-                        person_agnostic,
+                        person_condition,
+                        person_condition_mask,
                         masks.condition,
                         garment,
                         garment_mask,
@@ -217,5 +228,5 @@ class VTONPatchFlowForcing:
             else:
                 token_times = token_times + delta * masks.token.to(x.dtype)
                 xt = xt + delta * velocity * uncertain_latent
-            xt = masks.latent * xt + (1 - masks.latent) * person_agnostic
+            xt = masks.latent * xt + (1 - masks.latent) * person_context
         return xt

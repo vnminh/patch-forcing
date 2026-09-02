@@ -87,6 +87,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             self.state_channels + person_condition_channels,
             self.hidden_size,
             bias=True,
+            strict_img_size=False,
         )
         self.garment_embedder = PatchEmbed(
             input_size,
@@ -94,6 +95,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             self.state_channels,
             self.hidden_size,
             bias=True,
+            strict_img_size=False,
         )
         with torch.no_grad():
             self.x_embedder.proj.weight.zero_()
@@ -166,6 +168,31 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         mask = F.max_pool2d(mask, kernel_size=self.patch_size, stride=self.patch_size)
         return mask.flatten(2).squeeze(1) > 0.5
 
+    def _position_embedding(self, height, width, dtype, device):
+        patch_height, patch_width = self.x_embedder.patch_size
+        grid_height = height // patch_height
+        grid_width = width // patch_width
+        base_height, base_width = self.x_embedder.grid_size
+        if (grid_height, grid_width) == (base_height, base_width):
+            return self.pos_embed.to(device=device, dtype=dtype)
+        position = self.pos_embed.reshape(1, base_height, base_width, self.hidden_size).permute(0, 3, 1, 2)
+        position = F.interpolate(position.float(), size=(grid_height, grid_width), mode="bicubic", align_corners=False)
+        return position.permute(0, 2, 3, 1).flatten(1, 2).to(device=device, dtype=dtype)
+
+    def _unpatchify_rectangular(self, tokens, height, width):
+        patch_height, patch_width = self.x_embedder.patch_size
+        grid_height = height // patch_height
+        grid_width = width // patch_width
+        if tokens.shape[1] != grid_height * grid_width:
+            raise ValueError(f"Expected {grid_height * grid_width} output tokens, got {tokens.shape[1]}")
+        tokens = tokens.reshape(
+            tokens.shape[0], grid_height, grid_width, patch_height, patch_width, self.out_channels
+        )
+        tokens = torch.einsum("nhwpqc->nchpwq", tokens)
+        return tokens.reshape(
+            tokens.shape[0], self.out_channels, grid_height * patch_height, grid_width * patch_width
+        )
+
     def forward(
         self,
         x,
@@ -173,6 +200,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         y=None,
         person_agnostic=None,
         person_mask=None,
+        edit_mask=None,
         garment=None,
         garment_mask=None,
         return_uncertainty=False,
@@ -184,8 +212,11 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             person_mask = torch.zeros((batch, 1, height, width), device=x.device, dtype=x.dtype)
         person_agnostic = F.interpolate(person_agnostic, size=(height, width), mode="bilinear", align_corners=False)
         person_mask = F.interpolate(person_mask.float(), size=(height, width), mode="area").to(x.dtype)
+        if edit_mask is None:
+            edit_mask = person_mask
         x = torch.cat((x, person_agnostic, person_mask), dim=1)
-        x = self.x_embedder(x) + self.pos_embed
+        position = self._position_embedding(height, width, x.dtype, x.device)
+        x = self.x_embedder(x) + position
 
         if t.ndim != 2 or t.shape[1] != x.shape[1]:
             raise ValueError(f"Expected per-token timesteps {(batch, x.shape[1])}, got {tuple(t.shape)}")
@@ -199,7 +230,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_padding_mask = None
         if garment is not None:
             garment = F.interpolate(garment, size=(height, width), mode="bilinear", align_corners=False)
-            garment_tokens = self.garment_embedder(garment) + self.pos_embed
+            garment_tokens = self.garment_embedder(garment) + position
             garment_keep = self._token_mask(garment_mask, (height, width))
             if garment_keep is not None:
                 empty = ~garment_keep.any(dim=1)
@@ -208,7 +239,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                     garment_keep[empty, 0] = True
                 garment_padding_mask = ~garment_keep
 
-        edit_token_mask = self._token_mask(person_mask, (height, width))
+        edit_token_mask = self._token_mask(edit_mask, (height, width))
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
                 x = checkpoint(
@@ -223,7 +254,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             else:
                 x = block(x, cond, garment_tokens, garment_padding_mask, edit_token_mask)
         x = self.final_layer(x, cond)
-        x = self.unpatchify(x)
+        x = self._unpatchify_rectangular(x, height, width)
         logvar_theta = x[:, -1:, :, :]
         velocity = x[:, :-1, :, :]
         if return_uncertainty:

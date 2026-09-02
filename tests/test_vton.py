@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 
@@ -6,6 +8,7 @@ from patch_flow.flow_vton import VTONPatchFlowForcing
 from patch_flow.models.pf_transformer import PatchForcingDiT
 from patch_flow.models.pf_transformer_vton import VTONPatchForcingDiT
 from patch_flow.vton_utils import compose_vton, prepare_vton_masks
+from patch_flow.vton_data import VTONHDDataset
 from train import repeat_dataloader
 
 
@@ -17,7 +20,27 @@ class ConstantVelocityModel(torch.nn.Module):
         return velocity
 
 
+class RecordingVelocityModel(ConstantVelocityModel):
+    def forward(self, x, t, person_agnostic=None, person_mask=None, edit_mask=None, **kwargs):
+        self.person_condition = person_agnostic.detach().clone()
+        self.person_mask = person_mask.detach().clone()
+        self.edit_mask = edit_mask.detach().clone()
+        return super().forward(x, t, **kwargs)
+
+
 class VTONTests(unittest.TestCase):
+    def test_preview_sample_is_moved_to_front(self):
+        with TemporaryDirectory() as directory:
+            pair_list = Path(directory) / "test_pairs.txt"
+            pair_list.write_text("first.jpg first.jpg\ndetail.jpg detail.jpg\n", encoding="utf-8")
+            dataset = VTONHDDataset(
+                directory,
+                split="test",
+                pair_list=str(pair_list),
+                preview_sample_id="detail.jpg",
+            )
+            self.assertEqual(dataset.pairs[0], ("detail.jpg", "detail.jpg"))
+
     def test_finite_dataloader_repeats_until_step_limit(self):
         batches = repeat_dataloader([0, 1, 2, 3], max_epochs=-1)
         self.assertEqual([next(batches) for _ in range(10)], [0, 1, 2, 3, 0, 1, 2, 3, 0, 1])
@@ -90,6 +113,60 @@ class VTONTests(unittest.TestCase):
         self.assertGreater(model.x_embedder.proj.weight.grad[:, 4:].abs().sum().item(), 0)
         cross = model.blocks[0].garment_cross_attention.out_proj.weight.grad
         self.assertGreater(cross.abs().sum().item(), 0)
+
+    def test_model_supports_rectangular_latents(self):
+        model = VTONPatchForcingDiT(
+            input_size=8,
+            patch_size=2,
+            in_channels=4,
+            hidden_size=64,
+            depth=1,
+            num_heads=4,
+            num_classes=10,
+            predict_uncertainty=True,
+            cross_attention_every=1,
+            compile=False,
+        ).eval()
+        latent = torch.randn(1, 4, 8, 6)
+        mask = torch.ones(1, 1, 8, 6)
+        with torch.no_grad():
+            velocity, logvar = model(
+                latent,
+                torch.rand(1, 12),
+                torch.zeros(1, dtype=torch.long),
+                person_agnostic=torch.randn_like(latent),
+                person_mask=mask,
+                edit_mask=mask,
+                garment=torch.randn_like(latent),
+                garment_mask=mask,
+                return_uncertainty=True,
+            )
+        self.assertEqual(velocity.shape, latent.shape)
+        self.assertEqual(logvar.shape, (1, 1, 8, 6))
+
+    def test_expanded_edit_mask_does_not_erase_person_condition(self):
+        flow = VTONPatchFlowForcing(patch_size=2, mask_dilation_tokens=1)
+        raw_mask = torch.zeros(1, 1, 8, 8)
+        raw_mask[:, :, 2:6, 2:6] = 1
+        remove_masks = flow.prepare_masks(raw_mask, (8, 8), torch.float32, dilation_tokens=0)
+        edit_masks = flow.prepare_masks(raw_mask, (8, 8), torch.float32, dilation_tokens=1)
+        person_condition = torch.ones(1, 4, 8, 8) * (1 - remove_masks.latent)
+        person_context = person_condition * (1 - edit_masks.latent)
+        model = RecordingVelocityModel()
+        flow.generate(
+            model,
+            torch.randn_like(person_context),
+            person_context,
+            raw_mask,
+            torch.zeros_like(person_context),
+            person_condition=person_condition,
+            person_condition_mask=remove_masks.condition,
+            num_steps=1,
+        )
+        ring = edit_masks.latent.bool() & ~remove_masks.latent.bool()
+        self.assertGreater(model.person_condition.masked_select(ring).abs().sum().item(), 0)
+        torch.testing.assert_close(model.person_mask, remove_masks.condition)
+        torch.testing.assert_close(model.edit_mask, edit_masks.condition)
 
     def test_sampler_preserves_latent_outside_mask(self):
         flow = VTONPatchFlowForcing(patch_size=2, mask_dilation_tokens=0)

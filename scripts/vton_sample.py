@@ -53,34 +53,38 @@ def main(args):
     autoencoder = instantiate_from_config(hyper_parameters["first_stage"]).to(device).eval()
     flow = instantiate_from_config(hyper_parameters["flow"])
 
-    person_image = load_rgb(args.person, args.image_size).to(device)
-    garment_image = load_rgb(args.garment, args.image_size).to(device)
-    edit_mask = load_mask(args.agnostic_mask, args.image_size).to(device)
-    garment_mask = load_mask(args.garment_mask, args.image_size).to(device) if args.garment_mask else None
+    image_size = (args.height, args.width) if args.height is not None else args.image_size
+    person_image = load_rgb(args.person, image_size).to(device)
+    garment_image = load_rgb(args.garment, image_size).to(device)
+    edit_mask = load_mask(args.agnostic_mask, image_size).to(device)
+    garment_mask = load_mask(args.garment_mask, image_size).to(device) if args.garment_mask else None
     person_agnostic_image = person_image * (1 - edit_mask)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        person_agnostic = autoencoder.encode(person_agnostic_image)
-        masks = flow.prepare_masks(edit_mask, person_agnostic.shape[-2:], person_agnostic.dtype)
-        expanded_image_mask = torch.nn.functional.interpolate(
-            masks.latent.float(),
-            size=person_image.shape[-2:],
-            mode="nearest",
+        agnostic_latent = autoencoder.encode(person_agnostic_image)
+        edit_masks = flow.prepare_masks(edit_mask, agnostic_latent.shape[-2:], agnostic_latent.dtype)
+        remove_masks = flow.prepare_masks(
+            edit_mask,
+            agnostic_latent.shape[-2:],
+            agnostic_latent.dtype,
+            dilation_tokens=0,
         )
-        person_agnostic_image = person_agnostic_image * (1 - expanded_image_mask)
-        person_agnostic = autoencoder.encode(person_agnostic_image) * (1 - masks.latent)
+        person_condition = agnostic_latent * (1 - remove_masks.latent)
+        person_context = agnostic_latent * (1 - edit_masks.latent)
         garment = autoencoder.encode(garment_image)
         generator = torch.Generator(device=device).manual_seed(args.seed)
         noise = torch.randn(
-            person_agnostic.shape,
+            person_context.shape,
             generator=generator,
             device=device,
-            dtype=person_agnostic.dtype,
+            dtype=person_context.dtype,
         )
         label = torch.full((1,), model.y_embedder.num_classes, device=device, dtype=torch.long)
         sample = flow.generate(
             model=model,
             x=noise,
-            person_agnostic=person_agnostic,
+            person_agnostic=person_context,
+            person_condition=person_condition,
+            person_condition_mask=remove_masks.condition,
             edit_mask=edit_mask,
             garment=garment,
             garment_mask=garment_mask,
@@ -93,7 +97,7 @@ def main(args):
             progress=True,
         )
         generated = autoencoder.decode(sample)
-        expanded = masks.latent
+        expanded = edit_masks.latent
         expanded = torch.nn.functional.interpolate(expanded, size=person_image.shape[-2:], mode="nearest")
         output = compose_vton(generated, person_image, expanded, feather_radius=args.feather_radius)
     save_image(output.float(), args.output, normalize=True, value_range=(-1, 1))
@@ -109,6 +113,8 @@ if __name__ == "__main__":
     parser.add_argument("--garment-mask")
     parser.add_argument("--output", default="vton_result.png")
     parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--height", type=int)
+    parser.add_argument("--width", type=int)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--cfg-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -117,4 +123,7 @@ if __name__ == "__main__":
     parser.add_argument("--inner-steps", type=int, default=3)
     parser.add_argument("--feather-radius", type=int, default=8)
     parser.add_argument("--no-ema", action="store_true")
-    main(parser.parse_args())
+    args = parser.parse_args()
+    if (args.height is None) != (args.width is None):
+        parser.error("--height and --width must be specified together")
+    main(args)
