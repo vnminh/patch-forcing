@@ -197,6 +197,8 @@ You can use `scripts/t2i_sample.py` to sample images based on a text prompt.
 
 The VTON extension fine-tunes the released PFT-XL checkpoint with a mask-constrained flow, a zero-initialized agnostic-person condition, and garment cross-attention. The expanded edit mask is applied before VAE encoding, and only the agnostic latent is used as model context; the complete paired image is used only as the supervised target and final RGB reference. It currently uses the native 256x256 PFT latent grid.
 
+See [`docs/VTON_PFT_DESIGN.md`](docs/VTON_PFT_DESIGN.md) for the complete timestep equations, architecture, conditioning paths, losses, leakage analysis, and adaptive sampler design.
+
 Prepare VITON-HD with `image`, `cloth`, `agnostic-mask`, and `cloth-mask` directories under each split, then set the dataset and pretrained checkpoint paths:
 
 ```bash
@@ -250,6 +252,18 @@ python train.py experiment=viton-pft-xl-smoke16gb
 ```
 
 This configuration uses batch size 1, four-step gradient accumulation, gradient checkpointing, adapter-only optimization, no EMA copy, eight-step validation sampling, 50 optimizer steps, and no statistical validation metrics. Its validation batch still saves both paired and unpaired try-on images.
+
+Validation preview sheets are saved periodically under `logs/<experiment>/<date>/<run>/previews/`. The smoke configuration validates every 10 optimizer steps and saves `stepXXXXXX.png` plus an updated `latest.png`. Configure training and preview periods from the command line:
+
+```bash
+python train.py experiment=viton-pft-xl-smoke16gb \
+  train_params.max_steps=100 \
+  train_params.val_check_interval=5 \
+  checkpoint_params.every_n_train_steps=20 \
+  trainer.params.preview_every_n_validations=1
+```
+
+`max_steps` and `val_check_interval` count optimizer updates. With `accumulate_grad_batches=4`, one optimizer update consumes four mini-batches.
 
 
 ## 🎓 Citation

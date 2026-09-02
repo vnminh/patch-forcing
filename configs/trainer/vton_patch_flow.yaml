@@ -23,6 +23,8 @@ params:
   outside_velocity_weight: 0.01
   garment_dropout_prob: 0.1
   train_adapters_only: false
+  save_validation_previews: true
+  preview_every_n_validations: 1
   sample_kwargs:
     num_steps: 30
     cfg_scale: 1.0

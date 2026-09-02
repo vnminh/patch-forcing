@@ -1,4 +1,7 @@
+import os
+
 import torch
+from torchvision.utils import save_image
 
 from jutils import exists
 
@@ -18,6 +21,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         train_adapters_only=False,
         backbone_lr_multiplier=0.1,
         compute_validation_metrics=True,
+        save_validation_previews=True,
+        preview_every_n_validations=1,
         **kwargs,
     ):
         super().__init__(*args, enable_metrics=compute_validation_metrics, **kwargs)
@@ -27,6 +32,10 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         self.backbone_lr_multiplier = float(backbone_lr_multiplier)
         self.train_adapters_only = bool(train_adapters_only)
         self.compute_validation_metrics = bool(compute_validation_metrics)
+        self.save_validation_previews = bool(save_validation_previews)
+        self.preview_every_n_validations = int(preview_every_n_validations)
+        if self.preview_every_n_validations < 1:
+            raise ValueError("preview_every_n_validations must be positive")
         if train_adapters_only:
             for parameter in self.model.parameters():
                 parameter.requires_grad = False
@@ -185,6 +194,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         if self.val_images is not None:
             for key, images in self.val_images.items():
                 log_images(self.logger, images, f"val/{key}/samples", stack="row", split=4, step=self.global_step)
+            if self.save_validation_previews and (self.val_epochs + 1) % self.preview_every_n_validations == 0:
+                self._save_validation_preview()
             self.val_images = None
         if self.compute_validation_metrics:
             metrics = self.metric_tracker.aggregate()
@@ -192,3 +203,17 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 self.log(f"val/{key}", value, sync_dist=True)
             self.metric_tracker.reset()
         self.val_epochs += 1
+
+    def _save_validation_preview(self):
+        log_dir = getattr(self.logger, "log_dir", None)
+        if not isinstance(log_dir, (str, os.PathLike)) or self.val_images is None:
+            return
+        keys = ("target", "person", "agnostic", "garment", "tryon")
+        rows = torch.stack([self.val_images[key] for key in keys], dim=1)
+        rows = rows.flatten(0, 1).float().cpu() / 255
+        preview_dir = os.path.join(log_dir, "previews")
+        os.makedirs(preview_dir, exist_ok=True)
+        step_path = os.path.join(preview_dir, f"step{self.global_step:06d}.png")
+        latest_path = os.path.join(preview_dir, "latest.png")
+        save_image(rows, step_path, nrow=len(keys), padding=4, pad_value=1)
+        save_image(rows, latest_path, nrow=len(keys), padding=4, pad_value=1)
