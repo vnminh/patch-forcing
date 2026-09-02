@@ -233,7 +233,7 @@ class VTONTests(unittest.TestCase):
         self.assertTrue(torch.all(timesteps.masked_select(masks.token) == 0))
         torch.testing.assert_close(xt.masked_select(masks.latent.bool()), noise.masked_select(masks.latent.bool()))
 
-    def test_dino_garment_projection_receives_gradients(self):
+    def test_coarse_garment_tokens_add_position_once(self):
         model = VTONPatchForcingDiT(
             input_size=8,
             patch_size=2,
@@ -243,48 +243,11 @@ class VTONTests(unittest.TestCase):
             num_heads=4,
             num_classes=10,
             predict_uncertainty=True,
-            garment_feature_dim=32,
-            use_vae_garment=False,
-            cross_attention_every=1,
-            compile=False,
-        ).train()
-        with torch.no_grad():
-            model.final_layer.linear.weight.normal_(std=0.01)
-            model.blocks[0].garment_cross_attention.out_proj.weight.normal_(std=0.01)
-        latent = torch.randn(1, 4, 8, 8)
-        mask = torch.ones(1, 1, 8, 8)
-        output = model(
-            latent,
-            torch.rand(1, 16),
-            torch.zeros(1, dtype=torch.long),
-            person_agnostic=torch.randn_like(latent),
-            person_mask=mask,
-            edit_mask=mask,
-            garment=torch.randn_like(latent),
-            garment_mask=mask,
-            garment_features=torch.randn(1, 32, 5, 4),
-        )
-        output.square().mean().backward()
-        self.assertGreater(model.garment_feature_proj.weight.grad.abs().sum().item(), 0)
-
-    def test_joint_garment_tokens_add_position_once(self):
-        model = VTONPatchForcingDiT(
-            input_size=8,
-            patch_size=2,
-            in_channels=4,
-            hidden_size=64,
-            depth=1,
-            num_heads=4,
-            num_classes=10,
-            predict_uncertainty=True,
-            garment_feature_dim=32,
             use_vae_garment=True,
             cross_attention_every=1,
             compile=False,
         ).eval()
         with torch.no_grad():
-            model.garment_feature_proj.weight.zero_()
-            model.garment_feature_proj.bias.zero_()
             model.garment_embedder.proj.weight.zero_()
             model.garment_embedder.proj.bias.zero_()
         captured = {}
@@ -305,11 +268,63 @@ class VTONTests(unittest.TestCase):
                 edit_mask=mask,
                 garment=torch.randn_like(latent),
                 garment_mask=mask,
-                garment_features=torch.randn(1, 32, 5, 4),
             )
         handle.remove()
         expected = model._position_embedding(8, 6, latent.dtype, latent.device)
         torch.testing.assert_close(captured["garment_tokens"], expected)
+
+    def test_multiscale_garment_attention_is_routed_by_depth(self):
+        routes = ("coarse", "coarse", "middle", "middle", "middle", "detail", "detail")
+        model = VTONPatchForcingDiT(
+            input_size=8,
+            patch_size=2,
+            in_channels=4,
+            hidden_size=64,
+            depth=7,
+            num_heads=4,
+            num_classes=10,
+            predict_uncertainty=True,
+            use_vae_garment=True,
+            garment_middle_channels=16,
+            garment_detail_channels=8,
+            garment_scale_routes=routes,
+            cross_attention_every=1,
+            compile=False,
+        ).eval()
+        captured = {}
+        handles = []
+        for index, block in enumerate(model.blocks):
+            attention = block._garment_attention()
+
+            def capture(_, inputs, index=index):
+                captured[index] = inputs[1].shape[1]
+
+            handles.append(attention.register_forward_pre_hook(capture))
+
+        latent = torch.randn(1, 4, 8, 6)
+        mask = torch.ones(1, 1, 64, 48)
+        with torch.no_grad():
+            model(
+                latent,
+                torch.rand(1, 12),
+                torch.zeros(1, dtype=torch.long),
+                person_agnostic=torch.randn_like(latent),
+                person_mask=mask,
+                edit_mask=mask,
+                garment=torch.randn_like(latent),
+                garment_mask=mask,
+                garment_middle=torch.randn(1, 16, 16, 12),
+                garment_detail=torch.randn(1, 8, 32, 24),
+            )
+        for handle in handles:
+            handle.remove()
+
+        self.assertEqual(tuple(block.garment_scale for block in model.blocks), routes)
+        self.assertEqual([captured[index] for index in range(5)], [12] * 5)
+        self.assertEqual([captured[index] for index in range(5, 7)], [48, 48])
+        self.assertTrue(hasattr(model.blocks[0], "garment_cross_attention"))
+        self.assertTrue(hasattr(model.blocks[2], "garment_middle_cross_attention"))
+        self.assertTrue(hasattr(model.blocks[5], "garment_detail_cross_attention"))
 
     def test_one_token_dilation(self):
         mask = torch.zeros(1, 1, 16, 16)

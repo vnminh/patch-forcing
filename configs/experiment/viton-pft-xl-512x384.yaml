@@ -11,13 +11,20 @@ name: vton/pft-xl-512x384
 model:
   params:
     gradient_checkpointing: true
-    garment_feature_dim: 384
     use_vae_garment: true
+    garment_middle_channels: 256
+    garment_detail_channels: 128
+    garment_scale_routes: [coarse, coarse, middle, middle, middle, detail, detail]
 
 data:
   params:
     batch_size: 1
     val_batch_size: 1
+
+trainer:
+  params:
+    compute_validation_metrics: false
+    detail_loss_weight: 0.05
 
 train_params:
   max_steps: 100000

@@ -10,7 +10,6 @@ params:
       root: ${oc.env:VITONHD_ROOT}
       split: train
       image_size: [512, 384]
-      dino_feature_dir: ${oc.env:VITONHD_DINO_DIR,null}
       random_flip: true
       paired: true
   validation:
@@ -19,7 +18,6 @@ params:
       root: ${oc.env:VITONHD_ROOT}
       split: test
       image_size: [512, 384]
-      dino_feature_dir: ${oc.env:VITONHD_DINO_DIR,null}
       random_flip: false
       paired: true
       preview_sample_id: null
