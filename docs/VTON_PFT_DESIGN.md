@@ -607,6 +607,8 @@ checkpoint_params:
 
 It therefore produces previews at optimizer steps 5, 10, 15, and so on through step 1000, and checkpoints at steps 500 and 1000.
 
+The smoke dataset contains only 32 training pairs, so the training loop reshuffles and repeats the finite dataloader across epochs until `max_steps` is reached. With batch size 1 and gradient accumulation 4, one pass supplies 8 optimizer updates; 1000 updates therefore require multiple passes over the smoke split.
+
 Settings can be changed without editing YAML:
 
 ```bash
