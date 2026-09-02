@@ -14,8 +14,8 @@ sys.path.insert(0, repo_dir)
 
 from jutils import instantiate_from_config
 
+from patch_flow.dino_garment import TrainableDinoGarmentEncoder
 from patch_flow.models.pf_transformer_vton import VTONPatchForcingDiT
-from patch_flow.vae_features import encode_vae_pyramid
 from patch_flow.vton_data import _letterbox
 from patch_flow.vton_utils import compose_vton
 
@@ -51,6 +51,25 @@ def main(args):
     state = VTONPatchForcingDiT._select_checkpoint_state(checkpoint, use_ema=not args.no_ema)
     model.load_state_dict(state, strict=True)
     model = model.to(device).eval()
+    garment_encoder_name = args.dino_model or hyper_parameters.get(
+        "garment_encoder_name", "facebook/dinov2-small"
+    )
+    garment_encoder_input_size = hyper_parameters.get("garment_encoder_input_size", (448, 336))
+    garment_encoder = TrainableDinoGarmentEncoder(
+        model_name=garment_encoder_name,
+        trainable_blocks=0,
+        input_size=garment_encoder_input_size,
+    )
+    encoder_prefix = "garment_encoder."
+    encoder_state = {
+        key[len(encoder_prefix) :]: value
+        for key, value in checkpoint["state_dict"].items()
+        if key.startswith(encoder_prefix)
+    }
+    if not encoder_state:
+        raise ValueError("Checkpoint does not contain the trainable DINO garment encoder")
+    garment_encoder.load_state_dict(encoder_state, strict=True)
+    garment_encoder = garment_encoder.to(device).eval()
     autoencoder = instantiate_from_config(hyper_parameters["first_stage"]).to(device).eval()
     flow = instantiate_from_config(hyper_parameters["flow"])
 
@@ -71,16 +90,7 @@ def main(args):
         )
         person_condition = agnostic_latent * (1 - remove_masks.latent)
         person_context = agnostic_latent * (1 - edit_masks.latent)
-        use_vae_garment = getattr(model, "use_vae_garment", True)
-        use_multiscale_garment = getattr(model, "use_multiscale_garment", False)
-        if not use_vae_garment and not use_multiscale_garment:
-            raise ValueError("The checkpoint has no VAE garment conditioning path")
-        garment_middle = None
-        garment_detail = None
-        if use_multiscale_garment:
-            garment, garment_middle, garment_detail = encode_vae_pyramid(autoencoder, garment_image)
-        else:
-            garment = autoencoder.encode(garment_image) if use_vae_garment else None
+        garment_features = garment_encoder(garment_image)
         generator = torch.Generator(device=device).manual_seed(args.seed)
         noise = torch.randn(
             person_context.shape,
@@ -96,10 +106,8 @@ def main(args):
             person_condition=person_condition,
             person_condition_mask=remove_masks.condition,
             edit_mask=edit_mask,
-            garment=garment,
             garment_mask=garment_mask,
-            garment_middle=garment_middle,
-            garment_detail=garment_detail,
+            garment_features=garment_features,
             y=label,
             num_steps=args.steps,
             cfg_scale=args.cfg_scale,
@@ -135,6 +143,7 @@ if __name__ == "__main__":
     parser.add_argument("--inner-steps", type=int, default=3)
     parser.add_argument("--feather-radius", type=int, default=8)
     parser.add_argument("--no-ema", action="store_true")
+    parser.add_argument("--dino-model")
     args = parser.parse_args()
     if (args.height is None) != (args.width is None):
         parser.error("--height and --width must be specified together")

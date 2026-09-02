@@ -127,7 +127,7 @@ conda activate pft-vton
 export PFT_XL_CKPT="$PWD/checkpoints/pft-xl_step400k_ema.ckpt"
 ```
 
-The script installs the pinned CUDA 12.8 dependencies, downloads PFT-XL and Stability AI's EMA SD VAE, verifies the VAE SHA-256 checksum, converts it to the bare state dictionary expected by `jutils`, and strictly loads both checkpoints. It is resumable and skips existing downloads. Useful overrides include `ENV_NAME`, `CHECKPOINTS_DIR`, `USE_CURRENT_ENV=1`, `SKIP_INSTALL=1`, `SKIP_VERIFY=1`, and `FORCE_DOWNLOAD=1`. Set `INSTALL_FLASH_ATTN=1` only when it is needed and the machine has a compatible CUDA build toolchain.
+The script installs the pinned CUDA 12.8 dependencies, downloads PFT-XL, Stability AI's EMA SD VAE, and DINOv2-small, verifies the VAE SHA-256 checksum, converts it to the bare state dictionary expected by `jutils`, and strictly loads the PFT/VAE checkpoints. It is resumable and skips existing downloads. Useful overrides include `ENV_NAME`, `CHECKPOINTS_DIR`, `DINO_MODEL`, `USE_CURRENT_ENV=1`, `SKIP_INSTALL=1`, `SKIP_VERIFY=1`, and `FORCE_DOWNLOAD=1`. Set `INSTALL_FLASH_ATTN=1` only when it is needed and the machine has a compatible CUDA build toolchain.
 
 We release two [Patch Forcing Transformer](https://ommer-lab.com/files/pft/) checkpoints: [PFT-B](https://ommer-lab.com/files/pft/pft-b_step400k_ema.ckpt) and [PFT-XL](https://ommer-lab.com/files/pft/pft-xl_step400k_ema.ckpt). The checkpoints contain the EMA weights, as well as the model config.
 
@@ -225,6 +225,22 @@ Add `--adaptive` after the uncertainty head has been fine-tuned. Pixels outside 
 
 #### Metadata transfer and 16 GB smoke run
 
+To deploy the full dataset and this working tree to the configured Vast.ai host,
+install the dependencies and checkpoints, and start the smoke run under
+Supervisor, run:
+
+```bash
+bash scripts/deploy_vton_remote.sh
+```
+
+The transfers are resumable. Run `scripts/transfer_code_remote.sh` and
+`scripts/transfer_data_remote.sh` separately when only one side changed;
+`scripts/transfer_vton_remote.sh` remains as a convenience wrapper for both.
+Override `REMOTE_HOST`, `REMOTE_PORT`, `REMOTE_ROOT`, or `LOCAL_DATASET` when
+needed. The data transfer uses six parallel rsync workers by default; override
+that with `TRANSFER_JOBS`. Use `DRY_RUN=1` to preview. The remote launch stage is
+`scripts/start_vton_training_remote.sh`.
+
 Transfer only pair lists and generated agnostic masks to a machine that already contains the original VITON-HD images:
 
 ```bash
@@ -265,7 +281,7 @@ python train.py experiment=viton-pft-xl-smoke16gb \
 
 `max_steps` and `val_check_interval` count optimizer updates. With `accumulate_grad_batches=4`, one optimizer update consumes four mini-batches.
 
-The 512-by-384 experiment uses the frozen SD VAE as a multiscale garment encoder. Its final latent is routed to blocks 4 and 8, its 1/4-scale feature map to blocks 12, 16, and 20, and its 1/2-scale detail map to blocks 24 and 28. DINO features and `VITONHD_DINO_DIR` are not used.
+The 512-by-384 experiment encodes garments online with DINOv2-small at 448 by 336. The first ten DINO blocks remain frozen; the final two blocks and output normalization are optimized at a separate low learning rate. Cached garment features and `VITONHD_DINO_DIR` are not used.
 
 
 ## 🎓 Citation

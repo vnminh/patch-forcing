@@ -85,10 +85,8 @@ class VTONPatchFlowForcing:
         person_condition,
         person_condition_mask,
         edit_condition_mask,
-        garment,
+        garment_features,
         garment_mask,
-        garment_middle,
-        garment_detail,
         y,
         cfg_scale,
         return_uncertainty,
@@ -97,14 +95,12 @@ class VTONPatchFlowForcing:
             person_agnostic=person_condition,
             person_mask=person_condition_mask,
             edit_mask=edit_condition_mask,
-            garment=garment,
+            garment_features=garment_features,
             garment_mask=garment_mask,
-            garment_middle=garment_middle,
-            garment_detail=garment_detail,
             y=y,
             return_uncertainty=return_uncertainty,
         )
-        if cfg_scale == 1.0 or (garment is None and garment_middle is None and garment_detail is None):
+        if cfg_scale == 1.0 or garment_features is None:
             return model(x=x, t=t, **kwargs)
 
         batch = x.shape[0]
@@ -114,12 +110,9 @@ class VTONPatchFlowForcing:
         kwargs["person_mask"] = self._repeat_condition(person_condition_mask, 2)
         kwargs["edit_mask"] = self._repeat_condition(edit_condition_mask, 2)
         kwargs["y"] = self._repeat_condition(y, 2)
-        if garment is not None:
-            kwargs["garment"] = torch.cat((torch.zeros_like(garment), garment), dim=0)
-        if garment_middle is not None:
-            kwargs["garment_middle"] = torch.cat((torch.zeros_like(garment_middle), garment_middle), dim=0)
-        if garment_detail is not None:
-            kwargs["garment_detail"] = torch.cat((torch.zeros_like(garment_detail), garment_detail), dim=0)
+        kwargs["garment_features"] = torch.cat(
+            (torch.zeros_like(garment_features), garment_features), dim=0
+        )
         if garment_mask is not None:
             kwargs["garment_mask"] = torch.cat((torch.zeros_like(garment_mask), garment_mask), dim=0)
         output = model(x=x_in, t=t_in, **kwargs)
@@ -157,10 +150,8 @@ class VTONPatchFlowForcing:
         x,
         person_agnostic,
         edit_mask,
-        garment,
+        garment_features,
         garment_mask=None,
-        garment_middle=None,
-        garment_detail=None,
         person_condition=None,
         person_condition_mask=None,
         y=None,
@@ -205,10 +196,8 @@ class VTONPatchFlowForcing:
                 person_condition,
                 person_condition_mask,
                 masks.condition,
-                garment,
+                garment_features,
                 garment_mask,
-                garment_middle,
-                garment_detail,
                 y,
                 cfg_scale,
                 return_uncertainty=adaptive,
@@ -237,10 +226,8 @@ class VTONPatchFlowForcing:
                         person_condition,
                         person_condition_mask,
                         masks.condition,
-                        garment,
+                        garment_features,
                         garment_mask,
-                        garment_middle,
-                        garment_detail,
                         y,
                         cfg_scale,
                         return_uncertainty=False,

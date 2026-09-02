@@ -11,10 +11,7 @@ name: vton/pft-xl-512x384
 model:
   params:
     gradient_checkpointing: true
-    use_vae_garment: true
-    garment_middle_channels: 256
-    garment_detail_channels: 128
-    garment_scale_routes: [coarse, coarse, middle, middle, middle, detail, detail]
+    garment_feature_dim: 384
 
 data:
   params:
@@ -24,11 +21,21 @@ data:
 trainer:
   params:
     compute_validation_metrics: false
-    detail_loss_weight: 0.05
+    ema_rate: 0.0
+    train_adapters_only: true
+    garment_encoder_name: facebook/dinov2-small
+    garment_encoder_trainable_blocks: 2
+    garment_encoder_input_size: [448, 336]
+    garment_encoder_lr: 5.0e-6
+    sample_kwargs:
+      num_steps: 8
+      cfg_scale: 1.5
+      adaptive: false
+      progress: false
 
 train_params:
   max_steps: 100000
   accumulate_grad_batches: 4
-  limit_val_batches: 32
-  val_check_interval: 5000
+  limit_val_batches: 1
+  val_check_interval: 1000
   precision: bf16-mixed

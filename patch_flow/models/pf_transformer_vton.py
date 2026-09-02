@@ -8,7 +8,7 @@ from .pf_transformer import PatchForcingDiT, pf_modulate
 
 
 class VTONPatchForcingBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, garment_scale=None):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_garment_cross_attention=False):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True)
@@ -24,35 +24,23 @@ class VTONPatchForcingBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True),
         )
-        self.garment_scale = garment_scale
-        self.use_garment_cross_attention = garment_scale is not None
+        self.use_garment_cross_attention = use_garment_cross_attention
         if self.use_garment_cross_attention:
             self.garment_norm = nn.LayerNorm(hidden_size, eps=1e-6)
-            attention = nn.MultiheadAttention(
+            self.garment_cross_attention = nn.MultiheadAttention(
                 hidden_size,
                 num_heads,
                 dropout=0.0,
                 batch_first=True,
             )
-            nn.init.zeros_(attention.out_proj.weight)
-            nn.init.zeros_(attention.out_proj.bias)
-            attention_name = (
-                "garment_cross_attention"
-                if garment_scale == "coarse"
-                else f"garment_{garment_scale}_cross_attention"
-            )
-            setattr(self, attention_name, attention)
-
-    def _garment_attention(self):
-        if self.garment_scale == "coarse":
-            return self.garment_cross_attention
-        return getattr(self, f"garment_{self.garment_scale}_cross_attention")
+            nn.init.zeros_(self.garment_cross_attention.out_proj.weight)
+            nn.init.zeros_(self.garment_cross_attention.out_proj.bias)
 
     def forward(self, x, c, garment_tokens=None, garment_padding_mask=None, edit_token_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         x = x + gate_msa * self.attn(pf_modulate(self.norm1(x), shift_msa, scale_msa))
         if self.use_garment_cross_attention and garment_tokens is not None:
-            cross, _ = self._garment_attention()(
+            cross, _ = self.garment_cross_attention(
                 self.garment_norm(x),
                 garment_tokens,
                 garment_tokens,
@@ -71,10 +59,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         self,
         *args,
         person_condition_channels=5,
-        use_vae_garment=True,
-        garment_middle_channels=None,
-        garment_detail_channels=None,
-        garment_scale_routes=None,
+        garment_feature_dim=384,
         cross_attention_every=4,
         gradient_checkpointing=False,
         pretrained_ckpt=None,
@@ -95,14 +80,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         patch_size = old_embedder.patch_size[0]
         self.state_channels = self.in_channels
         self.person_condition_channels = person_condition_channels
-        self.use_vae_garment = bool(use_vae_garment)
-        self.garment_middle_channels = None if garment_middle_channels is None else int(garment_middle_channels)
-        self.garment_detail_channels = None if garment_detail_channels is None else int(garment_detail_channels)
-        self.use_multiscale_garment = self.garment_middle_channels is not None or self.garment_detail_channels is not None
-        if self.use_multiscale_garment and (
-            self.garment_middle_channels is None or self.garment_detail_channels is None
-        ):
-            raise ValueError("Both garment_middle_channels and garment_detail_channels must be configured")
+        self.garment_feature_dim = int(garment_feature_dim)
         self.cross_attention_every = cross_attention_every
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.x_embedder = PatchEmbed(
@@ -113,64 +91,22 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             bias=True,
             strict_img_size=False,
         )
-        self.garment_embedder = None
-        if self.use_vae_garment:
-            self.garment_embedder = PatchEmbed(
-                input_size,
-                patch_size,
-                self.state_channels,
-                self.hidden_size,
-                bias=True,
-                strict_img_size=False,
-            )
-        self.garment_middle_embedder = None
-        self.garment_detail_embedder = None
-        if self.use_multiscale_garment:
-            self.garment_middle_embedder = nn.Conv2d(
-                self.garment_middle_channels, self.hidden_size, kernel_size=4, stride=4
-            )
-            self.garment_detail_embedder = nn.Conv2d(
-                self.garment_detail_channels, self.hidden_size, kernel_size=4, stride=4
-            )
-            nn.init.xavier_uniform_(self.garment_middle_embedder.weight, gain=0.1)
-            nn.init.xavier_uniform_(self.garment_detail_embedder.weight, gain=0.1)
-            nn.init.zeros_(self.garment_middle_embedder.bias)
-            nn.init.zeros_(self.garment_detail_embedder.bias)
+        self.garment_feature_norm = nn.LayerNorm(self.garment_feature_dim)
+        self.garment_feature_proj = nn.Linear(self.garment_feature_dim, self.hidden_size, bias=True)
+        self.garment_position_scale = nn.Parameter(torch.zeros(()))
+        nn.init.xavier_uniform_(self.garment_feature_proj.weight, gain=0.1)
+        nn.init.zeros_(self.garment_feature_proj.bias)
         with torch.no_grad():
             self.x_embedder.proj.weight.zero_()
             self.x_embedder.proj.weight[:, : self.state_channels].copy_(old_embedder.proj.weight)
             self.x_embedder.proj.bias.copy_(old_embedder.proj.bias)
-            if self.garment_embedder is not None:
-                self.garment_embedder.proj.weight.copy_(old_embedder.proj.weight)
-                self.garment_embedder.proj.bias.copy_(old_embedder.proj.bias)
-
         old_blocks = self.blocks
-        cross_attention_count = sum((index + 1) % cross_attention_every == 0 for index in range(len(old_blocks)))
-        if garment_scale_routes is None:
-            garment_scale_routes = ["coarse"] * cross_attention_count
-        else:
-            garment_scale_routes = list(garment_scale_routes)
-        if len(garment_scale_routes) != cross_attention_count:
-            raise ValueError(
-                f"Expected {cross_attention_count} garment scale routes, got {len(garment_scale_routes)}"
-            )
-        allowed_routes = {"coarse", "middle", "detail"}
-        if any(route not in allowed_routes for route in garment_scale_routes):
-            raise ValueError(f"Garment scale routes must be one of {sorted(allowed_routes)}")
-        if not self.use_multiscale_garment and any(route != "coarse" for route in garment_scale_routes):
-            raise ValueError("Middle/detail routes require multiscale garment channels")
-        self.garment_scale_routes = tuple(garment_scale_routes)
         self.blocks = nn.ModuleList()
-        route_index = 0
         for index, old_block in enumerate(old_blocks):
-            garment_scale = None
-            if (index + 1) % cross_attention_every == 0:
-                garment_scale = self.garment_scale_routes[route_index]
-                route_index += 1
             block = VTONPatchForcingBlock(
                 self.hidden_size,
                 self.num_heads,
-                garment_scale=garment_scale,
+                use_garment_cross_attention=(index + 1) % cross_attention_every == 0,
             )
             block.load_state_dict(old_block.state_dict(), strict=False)
             self.blocks.append(block)
@@ -208,13 +144,9 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 raise ValueError(f"Expected {self.state_channels} pretrained input channels, got {base_weight.shape[1]}")
             current[weight_key].zero_()
             current[weight_key][:, : self.state_channels] = base_weight
-            if self.garment_embedder is not None:
-                current["garment_embedder.proj.weight"] = base_weight.clone()
             loaded.add(weight_key)
         if bias_key in pretrained_state:
             current[bias_key] = pretrained_state[bias_key]
-            if self.garment_embedder is not None:
-                current["garment_embedder.proj.bias"] = pretrained_state[bias_key].clone()
             loaded.add(bias_key)
 
         ignored = {key for key in pretrained_state if key not in loaded}
@@ -266,10 +198,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         person_agnostic=None,
         person_mask=None,
         edit_mask=None,
-        garment=None,
+        garment_features=None,
         garment_mask=None,
-        garment_middle=None,
-        garment_detail=None,
         return_uncertainty=False,
     ):
         batch, _, height, width = x.shape
@@ -293,56 +223,48 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 y = torch.full((batch,), self.y_embedder.num_classes, device=x.device, dtype=torch.long)
             cond = cond + self.y_embedder(y, self.training)[:, None, :]
 
-        garment_tokens = {}
-        garment_grid_sizes = {}
-        garment_padding_masks = {}
-        if garment is not None and self.garment_embedder is not None:
-            garment = F.interpolate(garment, size=(height, width), mode="bilinear", align_corners=False)
-            garment_tokens["coarse"] = self.garment_embedder(garment) + position
-            garment_grid_sizes["coarse"] = (height // self.patch_size, width // self.patch_size)
-        if garment_middle is not None:
-            if self.garment_middle_embedder is None:
-                raise ValueError("garment_middle_channels must be configured")
-            middle = self.garment_middle_embedder(garment_middle).flatten(2).transpose(1, 2)
-            middle_grid = (garment_middle.shape[-2] // 4, garment_middle.shape[-1] // 4)
-            middle_position = self._grid_position_embedding(*middle_grid, x.dtype, x.device)
-            garment_tokens["middle"] = middle.to(x.dtype) + middle_position
-            garment_grid_sizes["middle"] = middle_grid
-        if garment_detail is not None:
-            if self.garment_detail_embedder is None:
-                raise ValueError("garment_detail_channels must be configured")
-            detail = self.garment_detail_embedder(garment_detail).flatten(2).transpose(1, 2)
-            detail_grid = (garment_detail.shape[-2] // 4, garment_detail.shape[-1] // 4)
-            detail_position = self._grid_position_embedding(*detail_grid, x.dtype, x.device)
-            garment_tokens["detail"] = detail.to(x.dtype) + detail_position
-            garment_grid_sizes["detail"] = detail_grid
-        for scale in garment_tokens:
-            token_height, token_width = garment_grid_sizes[scale]
-            mask_size = (token_height * self.patch_size, token_width * self.patch_size)
-            garment_keep = self._token_mask(garment_mask, mask_size)
+        garment_tokens = None
+        garment_padding_mask = None
+        if garment_features is not None:
+            if garment_features.ndim != 4 or garment_features.shape[1] != self.garment_feature_dim:
+                raise ValueError(
+                    f"Expected garment features (B,{self.garment_feature_dim},H,W), "
+                    f"got {tuple(garment_features.shape)}"
+                )
+            token_height = height // self.patch_size
+            token_width = width // self.patch_size
+            garment_features = F.interpolate(
+                garment_features,
+                size=(token_height, token_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            garment_features = garment_features.flatten(2).transpose(1, 2)
+            garment_features = self.garment_feature_norm(garment_features)
+            garment_tokens = self.garment_feature_proj(garment_features).to(x.dtype)
+            garment_tokens = garment_tokens + self.garment_position_scale.to(x.dtype) * position
+            garment_keep = self._token_mask(garment_mask, (height, width))
             if garment_keep is not None:
                 empty = ~garment_keep.any(dim=1)
                 if empty.any():
                     garment_keep = garment_keep.clone()
                     garment_keep[empty, 0] = True
-                garment_padding_masks[scale] = ~garment_keep
+                garment_padding_mask = ~garment_keep
 
         edit_token_mask = self._token_mask(edit_mask, (height, width))
         for block in self.blocks:
-            block_tokens = garment_tokens.get(block.garment_scale)
-            block_padding_mask = garment_padding_masks.get(block.garment_scale)
             if self.gradient_checkpointing and self.training:
                 x = checkpoint(
                     block,
                     x,
                     cond,
-                    block_tokens,
-                    block_padding_mask,
+                    garment_tokens,
+                    garment_padding_mask,
                     edit_token_mask,
                     use_reentrant=False,
                 )
             else:
-                x = block(x, cond, block_tokens, block_padding_mask, edit_token_mask)
+                x = block(x, cond, garment_tokens, garment_padding_mask, edit_token_mask)
         x = self.final_layer(x, cond)
         x = self._unpatchify_rectangular(x, height, width)
         logvar_theta = x[:, -1:, :, :]
