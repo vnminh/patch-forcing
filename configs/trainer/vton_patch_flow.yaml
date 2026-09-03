@@ -6,14 +6,18 @@ params:
     target: patch_flow.flow_vton.VTONPatchFlowForcing
     params:
       patch_size: 2
-      mask_dilation_tokens: 1
-      mask_dilation_jitter_tokens: 0
-      zero_time_probability: 0.3
+      # Garment-forcing: pure noise in the edit region, so the model must read the
+      # garment condition instead of the partially clean paired target.
+      zero_time_probability: 0.1
+      # Detail-refinement coverage: ceiling pinned at t=1. Without this the LTG ceiling
+      # sigma(loc+z) starves t>0.9, which is exactly where logo and text detail is written.
+      high_time_probability: 0.25
+      high_time_spread: 0.25
       timestep_sampler:
         target: patch_flow.timestep_schedules.LogitNormalTruncatedGaussian
         params:
-          std: 0.6
-          loc: 0.7
+          std: 0.25
+          loc: 0.5
           scale: 1.0
   lr: 1e-4
   backbone_lr_multiplier: 0.1
@@ -22,12 +26,19 @@ params:
   lr_scheduler_cfg: ${oc.select:lr_scheduler, null}
   uncertainty_weight: 0.01
   outside_velocity_weight: 0.01
+  # Optional first-difference L1 on the predicted clean latent; set to ~0.05 to push
+  # high-frequency garment structure harder.
+  detail_loss_weight: 0.0
   garment_dropout_prob: 0.1
+  use_dino_garment: true
   garment_encoder_name: facebook/dinov2-small
-  garment_encoder_trainable_blocks: 2
+  # Frozen. DINO only supplies semantic correspondence now that the VAE branches carry
+  # appearance, and pretrained DINOv2 is already strong at that. Raise this only to run
+  # the unfreezing ablation; garment_encoder_lr applies solely when it is > 0.
+  garment_encoder_trainable_blocks: 0
   garment_encoder_input_size: [448, 336]
   garment_encoder_gradient_checkpointing: false
-  garment_encoder_lr: 5.0e-6
+  garment_encoder_lr: 2.0e-5
   train_adapters_only: false
   save_validation_previews: true
   preview_every_n_validations: 1

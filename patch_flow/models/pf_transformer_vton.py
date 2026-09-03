@@ -6,9 +6,11 @@ from torch.utils.checkpoint import checkpoint
 
 from .pf_transformer import PatchForcingDiT, pf_modulate
 
+GARMENT_SCALES = ("dino", "coarse", "middle", "detail")
+
 
 class VTONPatchForcingBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_garment_cross_attention=False):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, garment_scale=None):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True)
@@ -24,7 +26,8 @@ class VTONPatchForcingBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True),
         )
-        self.use_garment_cross_attention = use_garment_cross_attention
+        self.garment_scale = garment_scale
+        self.use_garment_cross_attention = garment_scale is not None
         if self.use_garment_cross_attention:
             self.garment_norm = nn.LayerNorm(hidden_size, eps=1e-6)
             self.garment_cross_attention = nn.MultiheadAttention(
@@ -55,11 +58,31 @@ class VTONPatchForcingBlock(nn.Module):
 
 
 class VTONPatchForcingDiT(PatchForcingDiT):
+    """PFT-XL with person conditioning and multi-branch garment cross-attention.
+
+    Garment appearance reaches the backbone through up to four branches:
+
+    ``dino``    semantic DINOv2 patch features; establishes garment/body correspondence
+    ``coarse``  garment VAE latent, embedded by a copy of the pretrained patch projection
+    ``middle``  VAE encoder 1/4-resolution feature map
+    ``detail``  VAE encoder 1/2-resolution feature map, the finest appearance carrier
+
+    The DINO branch alone cannot transport logos, printed text, or colour blocks: its
+    features are appearance-invariant by construction. The VAE branches live in the same
+    representation space the pretrained denoiser already reads, so they can be copied.
+    """
+
     def __init__(
         self,
         *args,
         person_condition_channels=5,
+        use_dino_garment=True,
         garment_feature_dim=384,
+        use_vae_garment=True,
+        garment_middle_channels=None,
+        garment_detail_channels=None,
+        garment_scale_routes=None,
+        garment_embed_gain=1.0,
         cross_attention_every=4,
         gradient_checkpointing=False,
         pretrained_ckpt=None,
@@ -80,7 +103,12 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         patch_size = old_embedder.patch_size[0]
         self.state_channels = self.in_channels
         self.person_condition_channels = person_condition_channels
+        self.use_dino_garment = bool(use_dino_garment)
         self.garment_feature_dim = int(garment_feature_dim)
+        self.use_vae_garment = bool(use_vae_garment)
+        self.garment_middle_channels = None if garment_middle_channels is None else int(garment_middle_channels)
+        self.garment_detail_channels = None if garment_detail_channels is None else int(garment_detail_channels)
+        self.garment_embed_gain = float(garment_embed_gain)
         self.cross_attention_every = cross_attention_every
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.x_embedder = PatchEmbed(
@@ -91,28 +119,105 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             bias=True,
             strict_img_size=False,
         )
-        self.garment_feature_norm = nn.LayerNorm(self.garment_feature_dim)
-        self.garment_feature_proj = nn.Linear(self.garment_feature_dim, self.hidden_size, bias=True)
-        self.garment_position_scale = nn.Parameter(torch.zeros(()))
-        nn.init.xavier_uniform_(self.garment_feature_proj.weight, gain=0.1)
-        nn.init.zeros_(self.garment_feature_proj.bias)
+
+        self.garment_feature_norm = None
+        self.garment_feature_proj = None
+        self.garment_position_scale = None
+        if self.use_dino_garment:
+            self.garment_feature_norm = nn.LayerNorm(self.garment_feature_dim)
+            self.garment_feature_proj = nn.Linear(self.garment_feature_dim, self.hidden_size, bias=True)
+            # Unit gain: the cross-attention output projection is already zero-initialised, so
+            # attenuating the keys here only flattens the attention logits into a uniform
+            # average over every garment token.
+            nn.init.xavier_uniform_(self.garment_feature_proj.weight, gain=self.garment_embed_gain)
+            nn.init.zeros_(self.garment_feature_proj.bias)
+            # DINO supplies its own positional encoding, so the DiT grid embedding is optional.
+            self.garment_position_scale = nn.Parameter(torch.zeros(()))
+
+        self.garment_embedder = None
+        if self.use_vae_garment:
+            self.garment_embedder = PatchEmbed(
+                input_size,
+                patch_size,
+                self.state_channels,
+                self.hidden_size,
+                bias=True,
+                strict_img_size=False,
+            )
+        self.garment_middle_embedder = None
+        self.garment_detail_embedder = None
+        if (self.garment_middle_channels is None) != (self.garment_detail_channels is None):
+            raise ValueError("Both garment_middle_channels and garment_detail_channels must be configured")
+        self.use_multiscale_garment = self.garment_middle_channels is not None
+        if self.use_multiscale_garment:
+            self.garment_middle_embedder = nn.Conv2d(
+                self.garment_middle_channels, self.hidden_size, kernel_size=4, stride=4
+            )
+            self.garment_detail_embedder = nn.Conv2d(
+                self.garment_detail_channels, self.hidden_size, kernel_size=4, stride=4
+            )
+            for embedder in (self.garment_middle_embedder, self.garment_detail_embedder):
+                nn.init.xavier_uniform_(embedder.weight, gain=self.garment_embed_gain)
+                nn.init.zeros_(embedder.bias)
+
         with torch.no_grad():
             self.x_embedder.proj.weight.zero_()
             self.x_embedder.proj.weight[:, : self.state_channels].copy_(old_embedder.proj.weight)
             self.x_embedder.proj.bias.copy_(old_embedder.proj.bias)
+            if self.garment_embedder is not None:
+                self.garment_embedder.proj.weight.copy_(old_embedder.proj.weight)
+                self.garment_embedder.proj.bias.copy_(old_embedder.proj.bias)
+
         old_blocks = self.blocks
+        cross_attention_count = sum((index + 1) % cross_attention_every == 0 for index in range(len(old_blocks)))
+        self.garment_scale_routes = self._resolve_routes(garment_scale_routes, cross_attention_count)
         self.blocks = nn.ModuleList()
+        route_index = 0
         for index, old_block in enumerate(old_blocks):
+            garment_scale = None
+            if (index + 1) % cross_attention_every == 0:
+                garment_scale = self.garment_scale_routes[route_index]
+                route_index += 1
             block = VTONPatchForcingBlock(
                 self.hidden_size,
                 self.num_heads,
-                use_garment_cross_attention=(index + 1) % cross_attention_every == 0,
+                garment_scale=garment_scale,
             )
             block.load_state_dict(old_block.state_dict(), strict=False)
             self.blocks.append(block)
 
         if pretrained_ckpt is not None:
             self.load_pretrained_checkpoint(pretrained_ckpt, use_ema=pretrained_use_ema)
+
+    def _enabled_scales(self):
+        enabled = []
+        if self.use_dino_garment:
+            enabled.append("dino")
+        if self.use_vae_garment:
+            enabled.append("coarse")
+        if self.use_multiscale_garment:
+            enabled.extend(("middle", "detail"))
+        return enabled
+
+    def _resolve_routes(self, garment_scale_routes, cross_attention_count):
+        enabled = self._enabled_scales()
+        if not enabled:
+            raise ValueError("At least one garment conditioning branch must be enabled")
+        if garment_scale_routes is None:
+            garment_scale_routes = [enabled[0]] * cross_attention_count
+        else:
+            garment_scale_routes = list(garment_scale_routes)
+        if len(garment_scale_routes) != cross_attention_count:
+            raise ValueError(
+                f"Expected {cross_attention_count} garment scale routes, got {len(garment_scale_routes)}"
+            )
+        unknown = set(garment_scale_routes) - set(GARMENT_SCALES)
+        if unknown:
+            raise ValueError(f"Garment scale routes must be one of {list(GARMENT_SCALES)}, got {sorted(unknown)}")
+        disabled = set(garment_scale_routes) - set(enabled)
+        if disabled:
+            raise ValueError(f"Garment scale routes {sorted(disabled)} reference disabled branches")
+        return tuple(garment_scale_routes)
 
     @staticmethod
     def _select_checkpoint_state(checkpoint, use_ema=True):
@@ -144,9 +249,13 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 raise ValueError(f"Expected {self.state_channels} pretrained input channels, got {base_weight.shape[1]}")
             current[weight_key].zero_()
             current[weight_key][:, : self.state_channels] = base_weight
+            if self.garment_embedder is not None:
+                current["garment_embedder.proj.weight"] = base_weight.clone()
             loaded.add(weight_key)
         if bias_key in pretrained_state:
             current[bias_key] = pretrained_state[bias_key]
+            if self.garment_embedder is not None:
+                current["garment_embedder.proj.bias"] = pretrained_state[bias_key].clone()
             loaded.add(bias_key)
 
         ignored = {key for key in pretrained_state if key not in loaded}
@@ -190,6 +299,66 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             tokens.shape[0], self.out_channels, grid_height * patch_height, grid_width * patch_width
         )
 
+    def _garment_branches(self, garment_features, garment, garment_middle, garment_detail, x, position, height, width):
+        tokens = {}
+        grids = {}
+        token_height = height // self.patch_size
+        token_width = width // self.patch_size
+
+        if garment_features is not None and self.use_dino_garment:
+            if garment_features.ndim != 4 or garment_features.shape[1] != self.garment_feature_dim:
+                raise ValueError(
+                    f"Expected garment features (B,{self.garment_feature_dim},H,W), "
+                    f"got {tuple(garment_features.shape)}"
+                )
+            features = F.interpolate(
+                garment_features,
+                size=(token_height, token_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            features = features.flatten(2).transpose(1, 2)
+            features = self.garment_feature_norm(features)
+            dino = self.garment_feature_proj(features).to(x.dtype)
+            tokens["dino"] = dino + self.garment_position_scale.to(x.dtype) * position
+            grids["dino"] = (token_height, token_width)
+
+        if garment is not None and self.garment_embedder is not None:
+            latent = F.interpolate(garment, size=(height, width), mode="bilinear", align_corners=False)
+            tokens["coarse"] = self.garment_embedder(latent) + position
+            grids["coarse"] = (token_height, token_width)
+
+        for name, source, embedder in (
+            ("middle", garment_middle, self.garment_middle_embedder),
+            ("detail", garment_detail, self.garment_detail_embedder),
+        ):
+            if source is None:
+                continue
+            if embedder is None:
+                raise ValueError(f"garment_{name}_channels must be configured to use the '{name}' branch")
+            embedded = embedder(source)
+            grid = (embedded.shape[-2], embedded.shape[-1])
+            embedded = embedded.flatten(2).transpose(1, 2)
+            tokens[name] = embedded.to(x.dtype) + self._grid_position_embedding(*grid, x.dtype, x.device)
+            grids[name] = grid
+        return tokens, grids
+
+    def _garment_padding_masks(self, garment_mask, grids):
+        padding = {}
+        if garment_mask is None:
+            return padding
+        for name, (grid_height, grid_width) in grids.items():
+            mask_size = (grid_height * self.patch_size, grid_width * self.patch_size)
+            keep = self._token_mask(garment_mask, mask_size)
+            if keep is None:
+                continue
+            empty = ~keep.any(dim=1)
+            if empty.any():
+                keep = keep.clone()
+                keep[empty, 0] = True
+            padding[name] = ~keep
+        return padding
+
     def forward(
         self,
         x,
@@ -199,6 +368,9 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         person_mask=None,
         edit_mask=None,
         garment_features=None,
+        garment=None,
+        garment_middle=None,
+        garment_detail=None,
         garment_mask=None,
         return_uncertainty=False,
     ):
@@ -223,48 +395,27 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 y = torch.full((batch,), self.y_embedder.num_classes, device=x.device, dtype=torch.long)
             cond = cond + self.y_embedder(y, self.training)[:, None, :]
 
-        garment_tokens = None
-        garment_padding_mask = None
-        if garment_features is not None:
-            if garment_features.ndim != 4 or garment_features.shape[1] != self.garment_feature_dim:
-                raise ValueError(
-                    f"Expected garment features (B,{self.garment_feature_dim},H,W), "
-                    f"got {tuple(garment_features.shape)}"
-                )
-            token_height = height // self.patch_size
-            token_width = width // self.patch_size
-            garment_features = F.interpolate(
-                garment_features,
-                size=(token_height, token_width),
-                mode="bilinear",
-                align_corners=False,
-            )
-            garment_features = garment_features.flatten(2).transpose(1, 2)
-            garment_features = self.garment_feature_norm(garment_features)
-            garment_tokens = self.garment_feature_proj(garment_features).to(x.dtype)
-            garment_tokens = garment_tokens + self.garment_position_scale.to(x.dtype) * position
-            garment_keep = self._token_mask(garment_mask, (height, width))
-            if garment_keep is not None:
-                empty = ~garment_keep.any(dim=1)
-                if empty.any():
-                    garment_keep = garment_keep.clone()
-                    garment_keep[empty, 0] = True
-                garment_padding_mask = ~garment_keep
+        garment_tokens, garment_grids = self._garment_branches(
+            garment_features, garment, garment_middle, garment_detail, x, position, height, width
+        )
+        garment_padding_masks = self._garment_padding_masks(garment_mask, garment_grids)
 
         edit_token_mask = self._token_mask(edit_mask, (height, width))
         for block in self.blocks:
+            block_tokens = garment_tokens.get(block.garment_scale)
+            block_padding_mask = garment_padding_masks.get(block.garment_scale)
             if self.gradient_checkpointing and self.training:
                 x = checkpoint(
                     block,
                     x,
                     cond,
-                    garment_tokens,
-                    garment_padding_mask,
+                    block_tokens,
+                    block_padding_mask,
                     edit_token_mask,
                     use_reentrant=False,
                 )
             else:
-                x = block(x, cond, garment_tokens, garment_padding_mask, edit_token_mask)
+                x = block(x, cond, block_tokens, block_padding_mask, edit_token_mask)
         x = self.final_layer(x, cond)
         x = self._unpatchify_rectangular(x, height, width)
         logvar_theta = x[:, -1:, :, :]

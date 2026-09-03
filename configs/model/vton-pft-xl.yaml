@@ -8,6 +8,14 @@ params:
   num_heads: 16
   num_classes: 1000
   predict_uncertainty: true
+  # Semantic garment branch: establishes garment/body correspondence.
+  use_dino_garment: true
   garment_feature_dim: 384
+  # Appearance-faithful garment branches: transport colour blocks, logos and text.
+  use_vae_garment: true
+  garment_middle_channels: null
+  garment_detail_channels: null
+  garment_scale_routes: null
+  garment_embed_gain: 1.0
   cross_attention_every: 4
   pretrained_ckpt: ${oc.env:PFT_XL_CKPT,null}

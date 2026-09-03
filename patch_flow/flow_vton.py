@@ -5,40 +5,61 @@ from jutils import instantiate_from_config
 
 from patch_flow.vton_utils import prepare_vton_masks
 
+GARMENT_CONDITION_KEYS = ("garment_features", "garment", "garment_middle", "garment_detail")
+
 
 class VTONPatchFlowForcing:
     def __init__(
         self,
         timestep_sampler=None,
         patch_size=2,
-        mask_dilation_tokens=1,
-        mask_dilation_jitter_tokens=0,
         zero_time_probability=0.0,
+        high_time_probability=0.0,
+        high_time_spread=0.25,
     ):
         self.patch_size = int(patch_size)
-        self.mask_dilation_tokens = int(mask_dilation_tokens)
-        self.mask_dilation_jitter_tokens = int(mask_dilation_jitter_tokens)
         self.zero_time_probability = float(zero_time_probability)
+        self.high_time_probability = float(high_time_probability)
+        self.high_time_spread = float(high_time_spread)
         if not 0 <= self.zero_time_probability <= 1:
             raise ValueError("zero_time_probability must be in [0, 1]")
+        if not 0 <= self.high_time_probability <= 1:
+            raise ValueError("high_time_probability must be in [0, 1]")
+        if self.zero_time_probability + self.high_time_probability > 1:
+            raise ValueError("zero_time_probability and high_time_probability must sum to at most 1")
+        if not 0 < self.high_time_spread <= 0.5:
+            raise ValueError("high_time_spread must be in (0, 0.5]")
         self.t_sampler = torch.rand if timestep_sampler is None else instantiate_from_config(timestep_sampler)
 
-    def sample_training_dilation(self):
-        dilation = self.mask_dilation_tokens
-        if self.mask_dilation_jitter_tokens > 0:
-            dilation += int(torch.randint(self.mask_dilation_jitter_tokens + 1, ()).item())
-        return dilation
-
-    def prepare_masks(self, edit_mask, latent_size, dtype, dilation_tokens=None):
-        masks = prepare_vton_masks(
-            edit_mask,
-            latent_size,
-            patch_size=self.patch_size,
-            dilation_tokens=self.mask_dilation_tokens if dilation_tokens is None else dilation_tokens,
-        )
+    def prepare_masks(self, edit_mask, latent_size, dtype):
+        masks = prepare_vton_masks(edit_mask, latent_size, patch_size=self.patch_size)
         masks.condition = masks.condition.to(dtype)
         masks.latent = masks.latent.to(dtype)
         return masks
+
+    def _sample_high_times(self, batch, tokens, device, dtype):
+        """Token times spread below a ceiling pinned at t=1.
+
+        Mirrors LogitNormalTruncatedGaussian.get_time_with_mean(mean=1) so the
+        detail-refinement regime keeps the same heterogeneous-token structure as the
+        rest of training instead of collapsing to a single clean timestep.
+        """
+        times = 1.0 - torch.randn((batch, tokens), device=device, dtype=dtype).abs() * self.high_time_spread
+        return torch.where(times < 0, torch.rand_like(times), times)
+
+    def _sample_token_times(self, batch, tokens, device, dtype):
+        times = self.t_sampler((batch, tokens), device=device, dtype=dtype)
+        if self.zero_time_probability <= 0 and self.high_time_probability <= 0:
+            return times
+        draw = torch.rand((batch, 1), device=device)
+        if self.high_time_probability > 0:
+            force_high = (draw >= self.zero_time_probability) & (
+                draw < self.zero_time_probability + self.high_time_probability
+            )
+            times = torch.where(force_high, self._sample_high_times(batch, tokens, device, dtype), times)
+        if self.zero_time_probability > 0:
+            times = torch.where(draw < self.zero_time_probability, torch.zeros_like(times), times)
+        return times
 
     def get_interpolants(self, x1, person_context, edit_mask, x0=None, t=None, masks=None):
         if x1.shape != person_context.shape:
@@ -48,19 +69,11 @@ class VTONPatchFlowForcing:
         if x0 is None:
             x0 = torch.randn_like(x1)
         if masks is None:
-            masks = self.prepare_masks(
-                edit_mask,
-                x1.shape[-2:],
-                x1.dtype,
-                dilation_tokens=self.sample_training_dilation(),
-            )
+            masks = self.prepare_masks(edit_mask, x1.shape[-2:], x1.dtype)
         batch, _, height, width = x1.shape
         tokens = (height // self.patch_size) * (width // self.patch_size)
         if t is None:
-            t = self.t_sampler((batch, tokens), device=x1.device, dtype=x1.dtype)
-            if self.zero_time_probability > 0:
-                force_zero = torch.rand((batch, 1), device=x1.device) < self.zero_time_probability
-                t = torch.where(force_zero, torch.zeros_like(t), t)
+            t = self._sample_token_times(batch, tokens, x1.device, x1.dtype)
         if t.shape != (batch, tokens):
             raise ValueError(f"Expected timestep shape {(batch, tokens)}, got {tuple(t.shape)}")
         t_effective = torch.where(masks.token, t, torch.ones_like(t))
@@ -85,7 +98,7 @@ class VTONPatchFlowForcing:
         person_condition,
         person_condition_mask,
         edit_condition_mask,
-        garment_features,
+        garment_conditions,
         garment_mask,
         y,
         cfg_scale,
@@ -95,12 +108,12 @@ class VTONPatchFlowForcing:
             person_agnostic=person_condition,
             person_mask=person_condition_mask,
             edit_mask=edit_condition_mask,
-            garment_features=garment_features,
             garment_mask=garment_mask,
             y=y,
             return_uncertainty=return_uncertainty,
+            **garment_conditions,
         )
-        if cfg_scale == 1.0 or garment_features is None:
+        if cfg_scale == 1.0 or all(garment_conditions.get(key) is None for key in GARMENT_CONDITION_KEYS):
             return model(x=x, t=t, **kwargs)
 
         batch = x.shape[0]
@@ -110,9 +123,10 @@ class VTONPatchFlowForcing:
         kwargs["person_mask"] = self._repeat_condition(person_condition_mask, 2)
         kwargs["edit_mask"] = self._repeat_condition(edit_condition_mask, 2)
         kwargs["y"] = self._repeat_condition(y, 2)
-        kwargs["garment_features"] = torch.cat(
-            (torch.zeros_like(garment_features), garment_features), dim=0
-        )
+        for key in GARMENT_CONDITION_KEYS:
+            value = garment_conditions.get(key)
+            if value is not None:
+                kwargs[key] = torch.cat((torch.zeros_like(value), value), dim=0)
         if garment_mask is not None:
             kwargs["garment_mask"] = torch.cat((torch.zeros_like(garment_mask), garment_mask), dim=0)
         output = model(x=x_in, t=t_in, **kwargs)
@@ -150,7 +164,10 @@ class VTONPatchFlowForcing:
         x,
         person_agnostic,
         edit_mask,
-        garment_features,
+        garment_features=None,
+        garment=None,
+        garment_middle=None,
+        garment_detail=None,
         garment_mask=None,
         person_condition=None,
         person_condition_mask=None,
@@ -168,6 +185,12 @@ class VTONPatchFlowForcing:
             raise ValueError("uncertain_fraction must be in (0, 1]")
         if adaptive and inner_steps < 2:
             raise ValueError("Adaptive sampling requires at least two inner steps")
+        garment_conditions = dict(
+            garment_features=garment_features,
+            garment=garment,
+            garment_middle=garment_middle,
+            garment_detail=garment_detail,
+        )
         masks = self.prepare_masks(edit_mask, person_agnostic.shape[-2:], person_agnostic.dtype)
         batch, _, height, width = person_agnostic.shape
         person_context = person_agnostic * (1 - masks.latent)
@@ -196,7 +219,7 @@ class VTONPatchFlowForcing:
                 person_condition,
                 person_condition_mask,
                 masks.condition,
-                garment_features,
+                garment_conditions,
                 garment_mask,
                 y,
                 cfg_scale,
@@ -226,7 +249,7 @@ class VTONPatchFlowForcing:
                         person_condition,
                         person_condition_mask,
                         masks.condition,
-                        garment_features,
+                        garment_conditions,
                         garment_mask,
                         y,
                         cfg_scale,

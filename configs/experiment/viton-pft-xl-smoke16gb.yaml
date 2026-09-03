@@ -15,6 +15,9 @@ lr_scheduler:
 model:
   params:
     gradient_checkpointing: true
+    garment_middle_channels: 256
+    garment_detail_channels: 128
+    garment_scale_routes: [dino, dino, coarse, middle, middle, detail, detail]
 
 trainer:
   params:

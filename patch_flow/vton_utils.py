@@ -11,7 +11,14 @@ class VTONMasks:
     latent: torch.Tensor
 
 
-def prepare_vton_masks(mask, latent_size, patch_size=2, dilation_tokens=1):
+def prepare_vton_masks(mask, latent_size, patch_size=2):
+    """Convert a supplied agnostic mask into the three VTON mask representations.
+
+    The token grid is the finest granularity the sampler can address, so a token is
+    editable when any source pixel inside it is masked. No further dilation is applied:
+    growing the envelope past the token grid forces the model to re-synthesise identity
+    evidence (jaw, neck, hair) that it could otherwise copy.
+    """
     if mask.ndim == 3:
         mask = mask[:, None]
     if mask.ndim != 4 or mask.shape[1] != 1:
@@ -22,11 +29,7 @@ def prepare_vton_masks(mask, latent_size, patch_size=2, dilation_tokens=1):
 
     condition = F.interpolate(mask.float(), size=latent_size, mode="area").clamp(0, 1)
     token_size = (latent_height // patch_size, latent_width // patch_size)
-    token = F.adaptive_max_pool2d(mask.float(), token_size)
-    token = token > 0
-    if dilation_tokens > 0:
-        kernel = 2 * dilation_tokens + 1
-        token = F.max_pool2d(token.float(), kernel_size=kernel, stride=1, padding=dilation_tokens) > 0
+    token = F.adaptive_max_pool2d(mask.float(), token_size) > 0
     latent = token.repeat_interleave(patch_size, -2).repeat_interleave(patch_size, -1).float()
     expanded_soft = F.avg_pool2d(latent, kernel_size=3, stride=1, padding=1) * latent
     condition = torch.maximum(condition * latent, expanded_soft)

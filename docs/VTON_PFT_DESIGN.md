@@ -11,11 +11,11 @@ The training sample contains:
 | \(I^*\) | `image` | Complete paired ground-truth person image |
 | \(I_p\) | `person` | Person image used to construct the agnostic input |
 | \(I_a\) | `person_agnostic` | Person with the original garment removed |
-| \(I_g\) | `garment` | In-shop garment image |
+| \(I_g\) | `garment` | In-shop garment image; encoded by DINO **and** the VAE pyramid |
 | \(M\) | `agnostic_mask` | Region allowed to change; 1 means editable |
 | \(M_g\) | `garment_mask` | Foreground mask for garment attention tokens |
 
-Paired training normally has \(I_p=I^*\). This is safe only if the complete person is not used as model context. In this implementation, the full image is used as the supervised target and final RGB compositing reference. The context supplied to PFT is produced exclusively from the expanded agnostic image.
+Paired training normally has \(I_p=I^*\). This is safe only if the complete person is not used as model context. In this implementation, the full image is used as the supervised target and final RGB compositing reference. The context supplied to PFT is produced exclusively from the masked agnostic image.
 
 At inference, \(I_p\) can contain a different old garment. The agnostic mask removes it before VAE encoding, while \(I_g\) provides the desired garment.
 
@@ -24,17 +24,20 @@ At inference, \(I_p\) can contain a different old garment. The agnostic mask rem
 ```text
 Paired target I* -------------------------> frozen VAE encoder ---> target latent z*
 
-Person Ip ---> supplied agnostic mask M ---> token dilation
-          ---> expanded RGB mask M+ ---> remove garment before VAE
+Person Ip ---> supplied agnostic mask M ---> token-grid rounding only
+          ---> RGB mask M_T ---> remove garment before VAE
           ---> frozen VAE encoder -------------------------------> agnostic latent za
 
-Garment Ig ---> online fully trainable DINOv2-small -----------> garment feature map fg
+Garment Ig ---> frozen DINOv2-small --------------------------> semantic features fg
+           ---> frozen VAE encoder ---> latent zg -------------> coarse appearance tokens
+                                   \--> 1/4-res feature map --> middle appearance tokens
+                                   \--> 1/2-res feature map --> detail appearance tokens
 Garment mask Mg -------------------------------------------------> garment token key mask
 
 Noise epsilon + z* + za + token times --------------------------> evolving latent xt
 
 [xt, za, interpolated mask] ---> zero-initialized input extension
-fg + Mg ----------------------> garment cross-attention
+fg, zg, middle, detail + Mg --> routed garment cross-attention
 per-token time ---------------> per-token AdaLN modulation
                                      |
                               pretrained PFT-XL
@@ -48,11 +51,18 @@ per-token time ---------------> per-token AdaLN modulation
 original person RGB + feathered edit mask ---> exact outside-mask composite
 ```
 
+Garment appearance travels on four branches, not one. The DINO branch answers *which
+garment region belongs where on the body*; the three VAE branches answer *what that
+region actually looks like*. A DINO-only condition can only reproduce garment category
+and mean colour, because DINOv2 patch features are trained to be invariant to exactly
+the appearance detail a try-on model has to copy: printed text, logos, and
+colour-block seams.
+
 The full person latent is never used as clean context. This matters because masking a latent after encoding is insufficient: the VAE encoder has a spatial receptive field, so garment texture can already have spread into latent cells outside the nominal mask.
 
 ## 3. Mask representations
 
-One mask representation is not suitable for every operation. The implementation derives three masks from the supplied agnostic mask.
+One mask representation is not suitable for every operation. The implementation derives three masks from the supplied agnostic mask. All three describe the **same** editable region: the mask is never grown beyond the token grid.
 
 ### 3.1 Token schedule mask
 
@@ -64,15 +74,23 @@ M_T = \operatorname{MaxPoolToTokenGrid}(M).
 
 Max pooling is deliberate. Bilinear or average resizing could turn a small missed garment region into a low fractional value and then classify the token as preserved.
 
-The token mask is morphologically dilated:
+**No dilation is applied, and dilation is not configurable.** Token-grid rounding is the
+only permitted growth, and \(M_T\) is used for every purpose: sampled times, noise, loss,
+sampler updates, garment-attention queries, the person condition, and final compositing.
 
-\[
-M_T^+ = \operatorname{Dilate}(M_T, r).
-\]
+The rationale is quantitative. On the 11,647 VITON-HD training masks the supplied
+agnostic mask covers 37.6% of the frame. Max-pooling to the 32-by-24 token grid raises
+that to 45.0%, which is unavoidable at token granularity. One extra token of dilation
+raised it to **60.0%** — a 60% increase over the supplied mask. Because the pixel
+condition was masked at dilation 0 while generation ran at dilation 1, roughly 15% of the
+frame was re-synthesised with no pixel conditioning at all, even though ground-truth
+pixels existed there. At 512-by-384 that ring is the jawline, the neck, the hair falling
+over the shoulder, and the waistband, so identity drifted and the majority of the loss
+budget was spent re-inventing content that could simply have been copied.
 
-Max-pooling first rounds the supplied mask outward to complete PFT tokens. The edit/time path then applies one additional token of dilation without random jitter. The person-conditioning path uses the undilated token envelope, preventing the edit expansion from erasing nearby identity evidence.
-
-The split-mask configuration keeps the RGB agnostic condition masked only by the original removal mask. A separate edit mask receives one token of dilation and controls sampled times, noise, loss, sampler updates, garment-attention queries, and final compositing. The encoded person condition is cleared only under the undilated token mask, while the fixed flow context is cleared under the expanded edit mask. Identity evidence in the expansion ring therefore remains available as conditioning without being copied into the evolving state.
+Using one undilated mask therefore does three things: it restores ~15% of the frame to
+exact copying, it concentrates the flow loss inside the garment, and it removes the
+train-time discrepancy between the conditioned region and the generated region.
 
 For 512-by-384 training, the VAE produces a 64-by-48 latent and PFT uses a 32-by-24 token grid. PFT-XL's pretrained convolutional patch projection transfers directly. Its frozen 16-by-16 positional embedding is bicubically interpolated to the rectangular grid, so rectangular training fine-tunes from the square pretrained model without changing checkpoint parameter shapes.
 
@@ -83,7 +101,7 @@ With the current SD VAE downsampling factor of 8 and PFT patch size 2, one PFT t
 Each token value is repeated over its \(2\times2\) latent cells:
 
 \[
-M_L = \operatorname{Repeat}_{2\times2}(M_T^+).
+M_L = \operatorname{Repeat}_{2\times2}(M_T).
 \]
 
 This binary mask controls:
@@ -96,32 +114,32 @@ This binary mask controls:
 
 ### 3.3 Soft conditioning mask
 
-A separate mask is area-resized to latent resolution and combined with a softened version of the expanded hard mask. This one-channel map is supplied to the network as a condition. It tells the model where the boundary lies without being responsible for the safety-critical update decision.
+A separate mask is area-resized to latent resolution and combined with a softened version of the hard mask. This one-channel map is supplied to the network as a condition. It tells the model where the boundary lies without being responsible for the safety-critical update decision. It is passed as both the person-condition mask and the edit mask, since the two regions now coincide.
 
 ### 3.4 RGB compositing mask
 
-After VAE decoding, the expanded mask is upsampled and feathered inward. The final output is
+After VAE decoding, the token mask is upsampled and feathered inward. The final output is
 
 \[
 I_{out}=\alpha I_{gen}+(1-\alpha)I_p.
 \]
 
-The support of \(\alpha\) is restricted to the expanded editable region. Therefore pixels outside that region are copied exactly from the original person image, even if the VAE decoder changes nearby pixels.
+The support of \(\alpha\) is restricted to the editable region. Therefore pixels outside that region are copied exactly from the original person image, even if the VAE decoder changes nearby pixels.
 
 ## 4. Preventing paired-data leakage
 
 The following order is important.
 
 1. Encode the target image to obtain its latent shape and the supervised target \(z^*=E(I^*)\).
-2. Create the expanded mask from the supplied agnostic mask.
-3. Upsample that expanded mask back to image resolution.
+2. Create the token mask from the supplied agnostic mask.
+3. Upsample that token mask back to image resolution.
 4. Apply it to the already agnostic RGB image:
 
    \[
-   I_a^+=I_a\odot(1-M^+).
+   I_a^+=I_a\odot(1-M_T).
    \]
 
-5. Encode only this expanded agnostic image:
+5. Encode only this masked agnostic image:
 
    \[
    z_a=E(I_a^+).
@@ -175,32 +193,77 @@ The configured `LogitNormalTruncatedGaussian` first samples a per-image time cei
 where the current configuration uses
 
 \[
-\mu=0.7,\qquad s=1.0.
+\mu=0.5,\qquad s=1.0.
 \]
 
-This logit-normal distribution gives a broad range of global noise levels while favoring useful intermediate and cleaner states.
+This logit-normal distribution gives a broad range of global noise levels. Note the
+structural consequence of the ceiling: because \(\bar t=\sigma(\mu+s\eta)\) is bounded away
+from 1 and no token may exceed it, **no choice of \(\mu\) or \(s\) can put meaningful
+probability mass near \(t=1\)**. Section 6.3 handles that regime explicitly instead.
 
 ### 6.2 Token times below the ceiling
 
 For each token, define
 
 \[
-\delta=\min(\bar t/2,\,0.6),
+\delta=\min(\bar t/2,\,s_{tok}),
 \]
 
 then sample
 
 \[
-t_i=\bar t-\delta|\eta_i|,qquad \eta_i\sim\mathcal N(0,1).
+t_i=\bar t-\delta|\eta_i|,\qquad \eta_i\sim\mathcal N(0,1).
 \]
 
 If a rare draw produces \(t_i<0\), it is replaced by a uniform sample in \([0,\bar t]\).
 
 Consequently, editable tokens have heterogeneous times but no editable token is cleaner than the sampled ceiling \(\bar t\). This is the LTG principle used by PFT to prevent the network from routinely seeing unrealistically clean generated patches during training.
 
-### 6.3 Garment-forcing samples
+The configured \(s_{tok}\) is 0.25. The previous value of 0.6 was inert: since
+\(\bar t\in(0,1)\) implies \(\bar t/2<0.5<0.6\), the minimum always selected \(\bar t/2\) and the
+parameter had no effect at all. At 0.25 the cap binds for \(\bar t>0.5\), which keeps
+tokens closer to their ceiling and widens coverage of the cleaner half of the schedule.
 
-With probability 0.3 per training example, every editable token time is overridden to zero. Its editable state is therefore pure noise, forcing prediction to use the person context and DINO garment condition instead of reading partially clean paired-target pixels from the flow state. The remaining 70% of examples retain heterogeneous PFT token times.
+### 6.3 Time mixture: garment forcing and detail refinement
+
+Each training example draws one of three time regimes.
+
+| Regime | Probability | Token times | Purpose |
+|---|---|---|---|
+| Garment forcing | 0.10 | all zero | editable state is pure noise, so prediction must use the person context and the garment condition rather than reading partially clean paired-target pixels out of the flow state |
+| Detail refinement | 0.25 | ceiling pinned at \(t=1\), same LTG spread below it | trains the end of the trajectory, where high-frequency garment structure is written |
+| LTG | 0.65 | \(\bar t=\sigma(0.5+\eta)\) with the spread of section 6.2 | the general patchwise-flow regime |
+
+The detail-refinement regime exists because the LTG ceiling starves the very timesteps
+that decide whether a logo appears. Measured over 20,000 draws of 768 tokens, the
+previous configuration (\(\mu=0.7\), \(s_{tok}=0.6\), garment forcing 0.3) produced:
+
+| | previous | current |
+|---|---|---|
+| mean \(t\) | 0.286 | 0.473 |
+| \(P(t>0.8)\) | 2.17% | 8.7% |
+| \(P(t>0.9)\) | **0.25%** | **7.8%** |
+| \(P(t>0.95)\) | 0.02% | — |
+| \(P(t>0.99)\) | **0.00%** | — |
+| \(P(t=0)\) | 29.2% | 10.2% |
+
+In rectified flow the interval \(t\to1\) is where fine structure — glyph edges, print
+boundaries, colour-block seams — is committed. Receiving 0.25% of the training signal
+there, and none at all above \(t=0.99\), meant the model was never taught to refine
+garment detail, only to decide a plausible average garment. The final step of an
+eight-step Euler sampler landed in a bin holding 0.5% of the training mass.
+
+There is a real tension here, and it is why garment forcing is reduced rather than
+removed. On paired data a high \(t\) means \(x_t\) already contains the true garment, so
+high-\(t\) training partly rewards copying from the flow state instead of reading the
+garment condition. Garment forcing is the counterweight. The resolution is that both
+regimes are necessary: low \(t\) teaches *what to put there* from the condition, high \(t\)
+teaches *how to sharpen it*. Starving either one is what produced a clean, correctly
+coloured, entirely blank T-shirt.
+
+The detail regime reuses the LTG spread with the ceiling set to 1, so it keeps the
+heterogeneous per-token structure of Patch Forcing rather than collapsing to a single
+clean timestep. `high_time_spread` controls that spread.
 
 ### 6.4 Known context versus generated tokens
 
@@ -209,8 +272,8 @@ After sampling, token times are overridden according to the edit mask:
 \[
 t_i^{eff}=
 \begin{cases}
-t_i,&M_{T,i}^+=1,\\
-1,&M_{T,i}^+=0.
+t_i,&M_{T,i}=1,\\
+1,&M_{T,i}=0.
 \end{cases}
 \]
 
@@ -283,13 +346,81 @@ The agnostic latent is supplied twice for different purposes:
 - as fixed clean context outside the edit region in \(x_t\);
 - as an explicit condition channel, allowing every editable query to access spatial person information through transformer self-attention.
 
+Both now use the same mask \(M_T\). Previously the condition channel used the undilated
+mask while the flow context used a dilated one, so the ring between them was generated
+without any pixel conditioning. With a single mask the two coincide and every preserved
+pixel remains available.
+
 Inside the hard editable region, the explicit agnostic latent is zero. Pose and identity cues therefore come from legitimate surrounding context rather than remnants of the old garment.
 
 ## 10. Garment conditioning
 
-Each garment is encoded online by DINOv2-small at 448 by 336. Its patch embedding, positional parameters, all 12 transformer blocks, and final normalization are trained through the VTON flow loss at a lower learning rate. Gradient checkpointing recomputes DINO activations during backward to reduce memory. A learned projection maps the 384-channel 32-by-24 DINO feature grid into the PFT hidden dimension. Garment background tokens are suppressed using the resized garment foreground mask \(M_g\).
+Garment appearance is injected through cross-attention in every fourth transformer block
+— blocks 4, 8, 12, 16, 20, 24, and 28 — and each of those seven blocks is *routed* to one
+of four garment branches.
 
-Every fourth transformer block contains garment cross-attention:
+### 10.1 The four branches
+
+| Branch | Source | Channels | Token grid at 512x384 | Tokens | What it carries |
+|---|---|---|---|---|---|
+| `dino` | **frozen** DINOv2-small at 448x336 | 384 | 32x24 | 768 | semantics; garment/body correspondence |
+| `coarse` | garment VAE latent \(z_g=E(I_g)\) | 4 | 32x24 | 768 | global appearance in the backbone's own latent space |
+| `middle` | SD-VAE encoder 1/4-resolution feature map | 256 | 32x24 | 768 | mid-frequency appearance |
+| `detail` | SD-VAE encoder 1/2-resolution feature map | 128 | **64x48** | **3072** | high-frequency appearance: glyphs, print edges, seams |
+
+The `coarse` branch is embedded by a `PatchEmbed` whose weights are *copied from the
+pretrained PFT-XL patch projection*, so garment tokens arrive in exactly the
+representation the pretrained denoiser already reads. The `middle` and `detail` maps are
+embedded by 4x4-stride convolutions. The `detail` branch is the only branch with a finer
+grid than the person stream: four times the spatial resolution, at roughly 8 input pixels
+per token instead of 16.
+
+### 10.1.1 Why DINO is frozen
+
+`garment_encoder_trainable_blocks` defaults to `0`. Once the VAE branches carry
+appearance, the DINO branch has exactly one job — semantic correspondence — and
+pretrained DINOv2 is already a strong off-the-shelf semantic-correspondence extractor.
+Fine-tuning 22M parameters on ~11.6k VITON-HD pairs mostly risks degrading that
+representation for no gain on the thing that was actually broken.
+
+Freezing also pays for itself directly:
+
+- no gradients, no AdamW state for 22M parameters, and no retained DINO activations, which returns memory to the `detail` branch that needs it;
+- DINO gradient checkpointing becomes unnecessary, removing a recompute pass;
+- garment features become deterministic per garment image, so they are precomputable;
+- one fewer moving part while attributing the improvement to the restored VAE branches.
+
+The encoder wraps its forward in `torch.no_grad()` when fully frozen, so no graph is
+built even if a caller passes a graph-connected garment tensor. Raise
+`garment_encoder_trainable_blocks` above 0 only to run the unfreezing ablation;
+`garment_encoder_lr` applies solely in that case. Earlier revisions escalated to a full
+12-block fine-tune to chase garment colour and typography, but that was compensating for
+the missing appearance branches rather than fixing them.
+
+Why four branches rather than one: DINOv2 is trained for correspondence under heavy
+appearance augmentation, so its patch tokens are deliberately invariant to the exact
+appearance a try-on model must reproduce. It can report "dark navy panel here, lavender
+panel there" but not the shape of a letter. The VAE branches are reconstruction-faithful
+by construction and therefore copyable. Using DINO alone yields a garment of the correct
+category and mean colour with no logo, no printed text, and no colour blocking — which is
+precisely the failure this design exists to avoid.
+
+### 10.2 Routing
+
+`garment_scale_routes` assigns one branch to each cross-attention block. The 512-by-384
+configuration uses:
+
+```yaml
+garment_scale_routes: [dino, dino, coarse, middle, middle, detail, detail]
+```
+
+The ordering is deliberate. Establishing correspondence — deciding which part of a
+flat-lay garment belongs at which body location — is a semantic, mid-level problem, so
+the semantic branches come first, while the residual stream is still settling layout.
+Transporting exact appearance is a low-level problem and is placed last, close to the
+output, so fine structure is not washed out by the remaining blocks.
+
+### 10.3 Attention and token scale
 
 \[
 Q=W_Q h_{person},\qquad
@@ -298,22 +429,42 @@ V=W_V h_g,
 \]
 
 \[
-CA(h,z_g)=\operatorname{softmax}\left(\frac{QK^T}{\sqrt d}+B_{M_g}\right)V.
+CA(h,h_g)=\operatorname{softmax}\left(\frac{QK^T}{\sqrt d}+B_{M_g}\right)V.
 \]
 
-The cross-attention residual is multiplied by the editable query mask, so garment features are injected primarily into tokens that are allowed to change.
+The cross-attention residual is multiplied by the editable query mask, so garment
+features are injected only into tokens that are allowed to change. Output projections are
+zero-initialized, so at initialization the VTON model is numerically identical to
+pretrained PFT.
 
-Cross-attention is inserted after self-attention and before the MLP in blocks 4, 8, 12, 16, 20, 24, and 28.
+Garment token magnitude matters as much as garment token content. The embedding gain is
+`garment_embed_gain: 1.0`. It was previously 0.1, which had a measurable pathology: with
+LayerNorm-ed DINO features projected at gain 0.1, garment tokens entered at standard
+deviation 0.07 against a person stream at 1.0, giving cross-attention logits a standard
+deviation of 0.035 across 768 keys. Measured at 768 keys, peak attention probability was
+1.37x uniform — that is, the block returned an essentially unweighted average of every
+garment token, a single global garment descriptor with no spatial selectivity. At unit
+gain the same measurement gives 15.8x uniform. Attenuating the keys buys no stability,
+because the zero-initialized output projection already guarantees a no-op at
+initialization; it only flattens the attention.
 
-The cross-attention output projections are initialized to zero. A zero-initialized scalar controls any additional DiT positional embedding on the garment tokens because DINO already contains its own positional representation.
+`garment_mask` \(M_g\) does not replace garment features. It determines which garment
+tokens are valid keys and values, and it is recomputed per branch at that branch's own
+grid, so the finer `detail` grid gets a correspondingly finer foreground mask.
 
-The interpolated garment mask does not replace garment features. It only determines which DINO garment tokens are valid keys and values.
+Positional information differs by branch. The VAE branches receive the DiT grid
+positional embedding at full strength. The DINO branch receives it scaled by a single
+learned scalar initialized to zero, because DINOv2 already carries its own positional
+encoding internally.
 
 ## 11. Class and garment-free conditioning
 
 The ImageNet class embedding from PFT-XL is retained. When no VTON category label is supplied, the model uses the pretrained null-class index 1000.
 
-During training, the garment latent and garment mask are independently dropped for approximately 10% of samples. This teaches a garment-unconditional branch.
+During training, all garment branches and the garment mask are dropped together for
+approximately 10% of samples. Dropping them jointly matters: a null branch that still saw
+one of the four conditions would not be unconditional. This teaches a
+garment-unconditional branch.
 
 At guided inference, the conditional velocity is
 
@@ -321,13 +472,13 @@ At guided inference, the conditional velocity is
 v_{cfg}=v_{null}+w(v_{garment}-v_{null}),
 \]
 
-where \(w\) is `cfg_scale`. The agnostic person remains present in both branches; only the garment condition is removed from the null branch. This makes guidance strengthen garment identity without discarding person identity or pose context.
+where \(w\) is `cfg_scale`. The agnostic person remains present in both branches; only the garment conditions are removed from the null branch, all four together and by the same zeroing used at training time. This makes guidance strengthen garment identity without discarding person identity or pose context.
 
 ## 12. Training losses
 
 ### 12.1 Editable-region flow loss
 
-The main loss is evaluated only in the expanded editable region:
+The main loss is evaluated only in the editable region:
 
 \[
 \mathcal L_{flow}
@@ -366,13 +517,31 @@ The target velocity is scored under a diagonal Gaussian whose mean is the detach
 
 This loss is also restricted to the editable region and has default weight 0.01. Detaching the mean prevents the uncertainty objective from changing velocity merely to make variance prediction easier.
 
-### 12.4 Total loss
+### 12.4 Optional high-frequency detail loss
+
+`detail_loss_weight` enables an L1 penalty on first spatial differences of the predicted
+clean latent \(\hat z=x_t+(1-t)v_\theta\):
+
+\[
+\mathcal L_{detail}
+=\operatorname{mean}_{M_L}\left|\Delta_x\hat z-\Delta_x z^*\right|
++\operatorname{mean}_{M_L}\left|\Delta_y\hat z-\Delta_y z^*\right|.
+\]
+
+A plain MSE is tolerant of washed-out edges: blurring a logo costs little. Penalising the
+gradient field directly penalises that blur. It defaults to `0.0`; set it to about `0.05`
+to push high-frequency garment structure harder. It is disabled by default because it
+changes the loss balance and should be introduced as a deliberate, separately attributed
+change.
+
+### 12.5 Total loss
 
 \[
 \mathcal L
 =\mathcal L_{flow}
 +0.01\mathcal L_{outside}
-+0.01\mathcal L_\sigma.
++0.01\mathcal L_\sigma
++w_{detail}\mathcal L_{detail}.
 \]
 
 ## 13. Standard inference
@@ -388,8 +557,8 @@ Token times begin at
 \[
 t_i=
 \begin{cases}
-0,&M_{T,i}^+=1,\\
-1,&M_{T,i}^+=0.
+0,&M_{T,i}=1,\\
+1,&M_{T,i}=0.
 \end{cases}
 \]
 
@@ -438,7 +607,7 @@ Training and inference both contain clean agnostic context outside the edit mask
 
 ### 15.2 It prevents the simplest shortcut
 
-The old or paired garment is removed before VAE encoding, the edit envelope is dilated, and editable agnostic latent cells are zeroed again. The easiest path to low loss is therefore to use the supplied garment condition rather than copy the worn garment.
+The old or paired garment is removed before VAE encoding and editable agnostic latent cells are zeroed again. Garment forcing (section 6.3) additionally supplies pure noise in the edit region for 10% of examples. The easiest path to low loss is therefore to use the supplied garment condition rather than copy the worn garment.
 
 ### 15.3 It retains the pretrained image prior
 
@@ -453,7 +622,8 @@ Self-attention can use clean face, hair, body boundary, pose, and background tok
 - \(x_t\) represents the current generated state.
 - \(z_a\) represents person identity and spatial context without the old garment.
 - the soft mask identifies the editable boundary.
-- Fine-tuned DINO garment tokens provide spatial garment structure while adapting their final representation to the VTON reconstruction objective.
+- frozen DINO garment tokens establish garment/body correspondence.
+- the `coarse`, `middle`, and `detail` VAE branches carry copyable garment appearance at three spatial scales.
 - \(M_g\) removes irrelevant garment background keys.
 - per-token time tells the model how reliable each spatial token currently is.
 
@@ -469,12 +639,23 @@ The 16 GB smoke configuration uses:
 
 - batch size 1;
 - four-step gradient accumulation;
-- gradient checkpointing across transformer blocks;
+- gradient checkpointing across transformer blocks (DINO needs none, being frozen);
 - adapter, input projection, garment cross-attention, and final-layer training;
 - frozen remaining PFT backbone parameters;
 - no EMA model copy;
 - no FID network;
 - eight-step validation sampling.
+
+The `detail` branch is the dominant new memory cost: at 512-by-384 it contributes 3072
+garment keys per routed block instead of 768. Cross-attention is called with
+`need_weights=False` so PyTorch can use a memory-efficient attention kernel rather than
+materializing the full 768-by-3072 matrix, but activation memory still rises. The
+512-by-384 experiment therefore uses batch size 8 with four-step accumulation, holding
+the global batch at 32. That is a deliberately conservative starting point: freezing DINO
+gave back its optimizer state, gradients, and backward activations, so a larger batch may
+well fit — measure before assuming. If a run does not fit, halve the batch and double the
+accumulation before changing the routing; dropping a `detail` route is the change that
+costs the most quality.
 
 This mode is intended to validate data flow, checkpoint transfer, gradients, loss reduction, and paired/unpaired visual outputs. It is not a substitute for the later full-data ablation between adapter-only and broader attention fine-tuning.
 
@@ -483,7 +664,8 @@ This mode is intended to validate data flow, checkpoint transfer, gradients, los
 1. PFT-XL was pretrained on a square grid. The implementation supports 512-by-384 fine-tuning through positional interpolation, but this remains resolution transfer rather than native rectangular pretraining.
 2. One token equals roughly 16 input pixels. This handles small parsing errors but not large category topology changes by itself.
 3. The implementation has no DensePose or explicit pose encoder. It relies on agnostic spatial context and visible body boundaries.
-4. Full DINO fine-tuning improves adaptation to garment color and typography but costs more memory and can forget its pretrained representation. Exact readable text remains bounded by the 14-pixel DINO patch grid and frozen VAE decoder quality.
+4. DINO is frozen and is no longer the limiting factor for appearance, since the VAE branches carry it. Exact readable text is bounded by the 1/2-resolution VAE feature grid, the frozen VAE decoder, and the 16-pixel person token. Unfreezing DINO remains available as an ablation, but on a dataset this size it is a forgetting risk rather than an obvious gain.
+7. The `detail` branch quadruples the garment key count in the blocks it is routed to. Memory, not quality, is the binding constraint on how many blocks can use it.
 5. Adaptive uncertainty is meaningful only after the head has been trained on the VTON distribution.
 6. Unpaired validation has no pixel-aligned ground truth. It should be judged qualitatively or with garment/person-specific metrics, not SSIM against the input person.
 
@@ -497,8 +679,19 @@ The implementation should maintain these invariants:
 - Outside latent values do not change during either standard or adaptive sampling.
 - Outside RGB pixels equal the source person after final composition.
 - Garment cross-attention gradients reach its zero-initialized output projection.
+- Once that projection is non-zero, gradients reach all four garment branch embedders.
 - Person-condition gradients reach the five added input channels.
 - Uncertainty ranking considers editable tokens only.
+- The editable mask is never larger than the token-grid rounding of the supplied mask.
+- The `coarse` garment branch equals `first_stage.encode(garment)` exactly.
+- Garment cross-attention is measurably non-uniform at initialization.
+- The token-time distribution keeps non-trivial mass both at \(t=0\) and above \(t=0.9\).
+
+Note when debugging gradients locally: PFT's `final_layer.linear` is zero-initialized by
+the DiT convention, so **without** a pretrained checkpoint in `PFT_XL_CKPT` every upstream
+gradient is exactly zero and only `final_layer` trains. That is expected, not a broken
+conditioning path. Perturb `final_layer.linear.weight` before asserting anything about
+upstream gradients.
 
 The tests in `tests/test_vton.py` cover the principal architectural and preservation invariants.
 
@@ -506,13 +699,15 @@ The tests in `tests/test_vton.py` cover the principal architectural and preserva
 
 | Component | File |
 |---|---|
-| Trainable DINO garment encoder | `patch_flow/dino_garment.py` |
+| DINO garment encoder (frozen by default) | `patch_flow/dino_garment.py` |
+| Garment VAE pyramid extraction | `patch_flow/vae_features.py` |
 | VTON PFT architecture and conditioning | `patch_flow/models/pf_transformer_vton.py` |
 | Patchwise time construction and samplers | `patch_flow/flow_vton.py` |
 | Mask conversion and RGB composition | `patch_flow/vton_utils.py` |
 | Masked losses and VAE preprocessing | `patch_flow/trainer_vton.py` |
 | Paired/unpaired VITON-HD data | `patch_flow/vton_data.py` |
 | Full training configuration | `configs/experiment/viton-pft-xl.yaml` |
+| 512-by-384 configuration | `configs/experiment/viton-pft-xl-512x384.yaml` |
 | 16 GB smoke configuration | `configs/experiment/viton-pft-xl-smoke16gb.yaml` |
 | Single-example inference | `scripts/vton_sample.py` |
 
@@ -575,13 +770,13 @@ trainer:
     save_validation_previews: true
     preview_every_n_validations: 1
     sample_kwargs:
-      num_steps: 8
+      num_steps: 30
       adaptive: false
 ```
 
 - `save_validation_previews` enables PNG output.
 - `preview_every_n_validations: 1` saves at every validation event; use 2 to save every second event.
-- `sample_kwargs.num_steps` is the number of flow-sampling steps used to generate each preview. It does not change training length.
+- `sample_kwargs.num_steps` is the number of flow-sampling steps used to generate each preview. It does not change training length. Keep it at 30 or more for full runs: an eight-step preview is visibly under-resolved and will understate what the model has actually learned. Only the smoke configuration uses 8.
 - Adaptive sampling should remain disabled for early smoke training.
 
 Preview sheets are written to
@@ -591,7 +786,7 @@ logs/<experiment>/<date>/<run>/previews/stepXXXXXX.png
 logs/<experiment>/<date>/<run>/previews/latest.png
 ```
 
-Each row is one validation example. Columns are ordered as target, source person, expanded agnostic person, effective edit mask, garment, and try-on output. In the smoke split, the first row is paired and the second row is unpaired.
+Each row is one validation example. Columns are ordered as target, source person, agnostic person, effective edit mask, garment, and try-on output. In the smoke split, the first row is paired and the second row is unpaired.
 
 ### Smoke-test example
 

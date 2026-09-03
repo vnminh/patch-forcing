@@ -9,6 +9,7 @@ from patch_flow.diagonal_gaussian import DiagonalGaussian
 from patch_flow.dino_garment import TrainableDinoGarmentEncoder
 from patch_flow.log_utils import log_images
 from patch_flow.trainer import LatentFlowTrainer, un_normalize_ims
+from patch_flow.vae_features import encode_vae_pyramid
 from patch_flow.vton_utils import compose_vton, masked_mean
 
 
@@ -18,12 +19,14 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         *args,
         uncertainty_weight=0.01,
         outside_velocity_weight=0.01,
+        detail_loss_weight=0.0,
         garment_dropout_prob=0.1,
+        use_dino_garment=True,
         garment_encoder_name="facebook/dinov2-small",
-        garment_encoder_trainable_blocks=2,
+        garment_encoder_trainable_blocks=0,
         garment_encoder_input_size=(448, 336),
         garment_encoder_gradient_checkpointing=False,
-        garment_encoder_lr=5e-6,
+        garment_encoder_lr=2e-5,
         train_adapters_only=False,
         backbone_lr_multiplier=0.1,
         compute_validation_metrics=True,
@@ -34,19 +37,27 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         super().__init__(*args, enable_metrics=compute_validation_metrics, **kwargs)
         self.uncertainty_weight = float(uncertainty_weight)
         self.outside_velocity_weight = float(outside_velocity_weight)
+        self.detail_loss_weight = float(detail_loss_weight)
         self.garment_dropout_prob = float(garment_dropout_prob)
         self.garment_encoder_lr = float(garment_encoder_lr)
-        self.garment_encoder = TrainableDinoGarmentEncoder(
-            model_name=garment_encoder_name,
-            trainable_blocks=garment_encoder_trainable_blocks,
-            input_size=garment_encoder_input_size,
-            gradient_checkpointing=garment_encoder_gradient_checkpointing,
-        )
-        if self.garment_encoder.feature_dim != self.model.garment_feature_dim:
-            raise ValueError(
-                f"DINO feature dimension {self.garment_encoder.feature_dim} does not match "
-                f"model garment_feature_dim {self.model.garment_feature_dim}"
+        self.use_dino_garment = bool(use_dino_garment) and getattr(self.model, "use_dino_garment", True)
+        self.garment_encoder = None
+        if self.use_dino_garment:
+            self.garment_encoder = TrainableDinoGarmentEncoder(
+                model_name=garment_encoder_name,
+                trainable_blocks=garment_encoder_trainable_blocks,
+                input_size=garment_encoder_input_size,
+                gradient_checkpointing=garment_encoder_gradient_checkpointing,
             )
+            if self.garment_encoder.feature_dim != self.model.garment_feature_dim:
+                raise ValueError(
+                    f"DINO feature dimension {self.garment_encoder.feature_dim} does not match "
+                    f"model garment_feature_dim {self.model.garment_feature_dim}"
+                )
+        self.use_vae_garment = bool(getattr(self.model, "use_vae_garment", False))
+        self.use_multiscale_garment = bool(getattr(self.model, "use_multiscale_garment", False))
+        if not (self.use_dino_garment or self.use_vae_garment or self.use_multiscale_garment):
+            raise ValueError("At least one garment conditioning branch must be enabled")
         self.backbone_lr_multiplier = float(backbone_lr_multiplier)
         self.train_adapters_only = bool(train_adapters_only)
         self.compute_validation_metrics = bool(compute_validation_metrics)
@@ -102,119 +113,142 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
 
     def _encode_batch(self, batch):
         target = batch["image"]
-        person = batch.get("person", target)
         garment = batch["garment"]
         target_latent = batch.get("latent")
         if target_latent is None:
             target_latent = self.encode(target)
-        dilation = self.flow.sample_training_dilation() if self.training else self.flow.mask_dilation_tokens
-        edit_masks = self.flow.prepare_masks(
+        # A single mask: the token grid is already the finest editable granularity, so the
+        # generated region and the pixel-conditioned region coincide and no identity
+        # evidence is thrown away.
+        masks = self.flow.prepare_masks(
             batch["agnostic_mask"],
             target_latent.shape[-2:],
             target_latent.dtype,
-            dilation_tokens=dilation,
         )
-        remove_masks = self.flow.prepare_masks(
-            batch["agnostic_mask"],
-            target_latent.shape[-2:],
-            target_latent.dtype,
-            dilation_tokens=0,
-        )
-        person_agnostic_image = batch["person_agnostic"]
-        agnostic_latent = self.encode(person_agnostic_image)
-        person_condition = agnostic_latent * (1 - remove_masks.latent)
-        person_context = agnostic_latent * (1 - edit_masks.latent)
-        garment_features = self.garment_encoder(garment)
-        return (
-            target,
-            person,
-            person_agnostic_image,
-            target_latent,
-            person_context,
-            person_condition,
-            garment_features,
-            edit_masks,
-            remove_masks,
-        )
+        agnostic_latent = self.encode(batch["person_agnostic"])
+        person_context = agnostic_latent * (1 - masks.latent)
 
-    def _drop_garment(self, garment_features, garment_mask):
+        garment_latent = batch.get("garment_latent")
+        garment_middle = batch.get("garment_middle")
+        garment_detail = batch.get("garment_detail")
+        if self.use_multiscale_garment and (garment_middle is None or garment_detail is None):
+            garment_latent, garment_middle, garment_detail = encode_vae_pyramid(self.first_stage, garment)
+        elif self.use_vae_garment and garment_latent is None:
+            garment_latent = self.encode(garment)
+        if not self.use_vae_garment:
+            garment_latent = None
+        garment_features = self.garment_encoder(garment) if self.use_dino_garment else None
+        return {
+            "target_image": target,
+            "person_image": batch.get("person", target),
+            "agnostic_image": batch["person_agnostic"],
+            "target": target_latent,
+            "person_context": person_context,
+            "masks": masks,
+            "garment_features": garment_features,
+            "garment": garment_latent,
+            "garment_middle": garment_middle,
+            "garment_detail": garment_detail,
+        }
+
+    def _garment_conditions(self, encoded):
+        return {
+            key: encoded[key]
+            for key in ("garment_features", "garment", "garment_middle", "garment_detail")
+        }
+
+    def _drop_garment(self, conditions, garment_mask):
         if not self.training or self.garment_dropout_prob <= 0:
-            return garment_features, garment_mask
+            return conditions, garment_mask
+        reference = next((value for value in conditions.values() if value is not None), None)
+        if reference is None:
+            return conditions, garment_mask
         keep = (
-            torch.rand(garment_features.shape[0], device=garment_features.device)
-            >= self.garment_dropout_prob
-        ).to(garment_features.dtype)
+            torch.rand(reference.shape[0], device=reference.device) >= self.garment_dropout_prob
+        ).to(reference.dtype)
         keep_image = keep[:, None, None, None]
-        garment_features = garment_features * keep_image
+        conditions = {
+            key: None if value is None else value * keep_image.to(value.dtype)
+            for key, value in conditions.items()
+        }
         if garment_mask is not None:
-            garment_mask = garment_mask * keep_image
-        return garment_features, garment_mask
+            garment_mask = garment_mask * keep_image.to(garment_mask.dtype)
+        return conditions, garment_mask
+
+    @staticmethod
+    def _detail_loss(predicted, target, mask):
+        """L1 on first spatial differences: penalises washed-out high-frequency structure
+        (logo edges, printed text, colour-block seams) that a plain MSE tolerates."""
+        horizontal_mask = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+        vertical_mask = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+        horizontal = (predicted[:, :, :, 1:] - predicted[:, :, :, :-1]) - (
+            target[:, :, :, 1:] - target[:, :, :, :-1]
+        )
+        vertical = (predicted[:, :, 1:, :] - predicted[:, :, :-1, :]) - (
+            target[:, :, 1:, :] - target[:, :, :-1, :]
+        )
+        return masked_mean(horizontal.abs(), horizontal_mask) + masked_mean(vertical.abs(), vertical_mask)
 
     def forward(self, batch):
-        (
-            _,
-            _,
-            _,
-            target,
-            person_context,
-            person_condition,
-            garment_features,
-            edit_masks,
-            remove_masks,
-        ) = self._encode_batch(batch)
-        edit_mask = batch["agnostic_mask"].float()
-        garment_mask = batch.get("garment_mask")
-        garment_features, garment_mask = self._drop_garment(garment_features, garment_mask)
+        encoded = self._encode_batch(batch)
+        target = encoded["target"]
+        masks = encoded["masks"]
+        conditions, garment_mask = self._drop_garment(
+            self._garment_conditions(encoded), batch.get("garment_mask")
+        )
         xt, ut, timesteps, masks = self.flow.get_interpolants(
             target,
-            person_context,
-            edit_mask,
-            masks=edit_masks,
+            encoded["person_context"],
+            batch["agnostic_mask"].float(),
+            masks=masks,
         )
         label = self._label(batch, target.shape[0], target.device)
         velocity, logvar = self.model(
             x=xt,
             t=timesteps,
             y=label,
-            person_agnostic=person_condition,
-            person_mask=remove_masks.condition,
-            edit_mask=edit_masks.condition,
+            person_agnostic=encoded["person_context"],
+            person_mask=masks.condition,
+            edit_mask=masks.condition,
             garment_mask=garment_mask,
-            garment_features=garment_features,
             return_uncertainty=True,
+            **conditions,
         )
 
-        flow_loss = masked_mean((velocity - ut).square(), edit_masks.latent)
-        outside = 1 - edit_masks.latent
+        flow_loss = masked_mean((velocity - ut).square(), masks.latent)
+        outside = 1 - masks.latent
         outside_loss = masked_mean(velocity.square(), outside)
         distribution = DiagonalGaussian(mean=velocity.detach(), logvar=logvar)
-        uncertainty_loss = masked_mean(distribution.nll(ut), edit_masks.latent)
+        uncertainty_loss = masked_mean(distribution.nll(ut), masks.latent)
         loss = flow_loss + self.outside_velocity_weight * outside_loss + self.uncertainty_weight * uncertainty_loss
-        return loss, {
+        metrics = {
             "flow_loss": flow_loss,
             "outside_velocity_loss": outside_loss,
             "sigma_loss": uncertainty_loss,
-            "editable_fraction": edit_masks.latent.mean(),
+            "editable_fraction": masks.latent.mean(),
             "outside_fraction": outside.mean(),
-            "zero_time_fraction": ((timesteps == 0) & edit_masks.token).float().sum()
-            / edit_masks.token.float().sum().clamp_min(1),
+            "zero_time_fraction": ((timesteps == 0) & masks.token).float().sum()
+            / masks.token.float().sum().clamp_min(1),
+            "high_time_fraction": ((timesteps > 0.9) & masks.token).float().sum()
+            / masks.token.float().sum().clamp_min(1),
         }
+        if self.detail_loss_weight > 0:
+            time_latent = self.flow._tokens_to_latent(
+                timesteps, target.shape[-2], target.shape[-1], target.dtype
+            )
+            predicted_clean = xt + (1 - time_latent) * velocity
+            detail_loss = self._detail_loss(predicted_clean, target, masks.latent)
+            loss = loss + self.detail_loss_weight * detail_loss
+            metrics["detail_loss"] = detail_loss
+        return loss, metrics
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        (
-            target_image,
-            person_image,
-            agnostic_image,
-            target,
-            person_context,
-            person_condition,
-            garment_features,
-            edit_masks,
-            remove_masks,
-        ) = self._encode_batch(batch)
-        edit_mask = batch["agnostic_mask"].float()
-        garment_mask = batch.get("garment_mask")
+        encoded = self._encode_batch(batch)
+        target = encoded["target"]
+        masks = encoded["masks"]
+        target_image = encoded["target_image"]
+        person_image = encoded["person_image"]
         label = self._label(batch, target.shape[0], target.device)
         generator = self.generator.manual_seed(batch_idx + self.global_rank * 16102024)
         noise = torch.randn(target.shape, generator=generator, dtype=target.dtype).to(target.device)
@@ -222,18 +256,19 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         samples = self.flow.generate(
             model=sample_model,
             x=noise,
-            person_agnostic=person_context,
-            person_condition=person_condition,
-            person_condition_mask=remove_masks.condition,
-            edit_mask=edit_mask,
-            garment_mask=garment_mask,
-            garment_features=garment_features,
+            person_agnostic=encoded["person_context"],
+            person_condition=encoded["person_context"],
+            person_condition_mask=masks.condition,
+            edit_mask=batch["agnostic_mask"].float(),
+            garment_mask=batch.get("garment_mask"),
             y=label,
+            **self._garment_conditions(encoded),
             **self.sample_kwargs,
         )
         generated = self.decode(samples)
-        expanded = edit_masks.latent
-        expanded = torch.nn.functional.interpolate(expanded, size=target_image.shape[-2:], mode="nearest")
+        expanded = torch.nn.functional.interpolate(
+            masks.latent, size=target_image.shape[-2:], mode="nearest"
+        )
         composed = compose_vton(generated, person_image, expanded)
         has_ground_truth = batch.get("has_ground_truth")
         if self.compute_validation_metrics:
@@ -246,7 +281,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             self.val_images = {
                 "target": un_normalize_ims(target_image[:8]),
                 "person": un_normalize_ims(person_image[:8]),
-                "agnostic": un_normalize_ims(agnostic_image[:8]),
+                "agnostic": un_normalize_ims(encoded["agnostic_image"][:8]),
                 "edit_mask": mask_preview,
                 "garment": un_normalize_ims(batch["garment"][:8]),
                 "tryon": un_normalize_ims(composed[:8]),

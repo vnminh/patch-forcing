@@ -16,6 +16,7 @@ from jutils import instantiate_from_config
 
 from patch_flow.dino_garment import TrainableDinoGarmentEncoder
 from patch_flow.models.pf_transformer_vton import VTONPatchForcingDiT
+from patch_flow.vae_features import encode_vae_pyramid
 from patch_flow.vton_data import _letterbox
 from patch_flow.vton_utils import compose_vton
 
@@ -51,25 +52,27 @@ def main(args):
     state = VTONPatchForcingDiT._select_checkpoint_state(checkpoint, use_ema=not args.no_ema)
     model.load_state_dict(state, strict=True)
     model = model.to(device).eval()
-    garment_encoder_name = args.dino_model or hyper_parameters.get(
-        "garment_encoder_name", "facebook/dinov2-small"
-    )
-    garment_encoder_input_size = hyper_parameters.get("garment_encoder_input_size", (448, 336))
-    garment_encoder = TrainableDinoGarmentEncoder(
-        model_name=garment_encoder_name,
-        trainable_blocks=0,
-        input_size=garment_encoder_input_size,
-    )
     encoder_prefix = "garment_encoder."
     encoder_state = {
         key[len(encoder_prefix) :]: value
         for key, value in checkpoint["state_dict"].items()
         if key.startswith(encoder_prefix)
     }
-    if not encoder_state:
-        raise ValueError("Checkpoint does not contain the trainable DINO garment encoder")
-    garment_encoder.load_state_dict(encoder_state, strict=True)
-    garment_encoder = garment_encoder.to(device).eval()
+    garment_encoder = None
+    if getattr(model, "use_dino_garment", False):
+        if not encoder_state:
+            raise ValueError("Checkpoint does not contain the trainable DINO garment encoder")
+        garment_encoder_name = args.dino_model or hyper_parameters.get(
+            "garment_encoder_name", "facebook/dinov2-small"
+        )
+        garment_encoder_input_size = hyper_parameters.get("garment_encoder_input_size", (448, 336))
+        garment_encoder = TrainableDinoGarmentEncoder(
+            model_name=garment_encoder_name,
+            trainable_blocks=0,
+            input_size=garment_encoder_input_size,
+        )
+        garment_encoder.load_state_dict(encoder_state, strict=True)
+        garment_encoder = garment_encoder.to(device).eval()
     autoencoder = instantiate_from_config(hyper_parameters["first_stage"]).to(device).eval()
     flow = instantiate_from_config(hyper_parameters["flow"])
 
@@ -81,16 +84,18 @@ def main(args):
     person_agnostic_image = person_image * (1 - edit_mask)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         agnostic_latent = autoencoder.encode(person_agnostic_image)
-        edit_masks = flow.prepare_masks(edit_mask, agnostic_latent.shape[-2:], agnostic_latent.dtype)
-        remove_masks = flow.prepare_masks(
-            edit_mask,
-            agnostic_latent.shape[-2:],
-            agnostic_latent.dtype,
-            dilation_tokens=0,
-        )
-        person_condition = agnostic_latent * (1 - remove_masks.latent)
-        person_context = agnostic_latent * (1 - edit_masks.latent)
-        garment_features = garment_encoder(garment_image)
+        masks = flow.prepare_masks(edit_mask, agnostic_latent.shape[-2:], agnostic_latent.dtype)
+        person_context = agnostic_latent * (1 - masks.latent)
+        garment_features = garment_encoder(garment_image) if garment_encoder is not None else None
+        garment_latent = None
+        garment_middle = None
+        garment_detail = None
+        if getattr(model, "use_multiscale_garment", False):
+            garment_latent, garment_middle, garment_detail = encode_vae_pyramid(autoencoder, garment_image)
+        elif getattr(model, "use_vae_garment", False):
+            garment_latent = autoencoder.encode(garment_image)
+        if not getattr(model, "use_vae_garment", False):
+            garment_latent = None
         generator = torch.Generator(device=device).manual_seed(args.seed)
         noise = torch.randn(
             person_context.shape,
@@ -103,11 +108,14 @@ def main(args):
             model=model,
             x=noise,
             person_agnostic=person_context,
-            person_condition=person_condition,
-            person_condition_mask=remove_masks.condition,
+            person_condition=person_context,
+            person_condition_mask=masks.condition,
             edit_mask=edit_mask,
             garment_mask=garment_mask,
             garment_features=garment_features,
+            garment=garment_latent,
+            garment_middle=garment_middle,
+            garment_detail=garment_detail,
             y=label,
             num_steps=args.steps,
             cfg_scale=args.cfg_scale,
@@ -117,8 +125,9 @@ def main(args):
             progress=True,
         )
         generated = autoencoder.decode(sample)
-        expanded = edit_masks.latent
-        expanded = torch.nn.functional.interpolate(expanded, size=person_image.shape[-2:], mode="nearest")
+        expanded = torch.nn.functional.interpolate(
+            masks.latent, size=person_image.shape[-2:], mode="nearest"
+        )
         output = compose_vton(generated, person_image, expanded, feather_radius=args.feather_radius)
     save_image(output.float(), args.output, normalize=True, value_range=(-1, 1))
     print(f"Saved try-on result to {args.output}")

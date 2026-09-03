@@ -12,24 +12,33 @@ model:
   params:
     gradient_checkpointing: true
     garment_feature_dim: 384
+    # SD-VAE encoder taps: 1/4 resolution has 256 channels, 1/2 resolution has 128.
+    garment_middle_channels: 256
+    garment_detail_channels: 128
+    # Blocks 4, 8, 12, 16, 20, 24, 28. Correspondence first (dino/coarse), appearance
+    # transport last (detail), so fine structure is written close to the output and is
+    # not washed out by the remaining blocks.
+    garment_scale_routes: [dino, dino, coarse, middle, middle, detail, detail]
 
 data:
   params:
-    batch_size: 1
+    # The detail branch adds 3072 garment keys at 512x384; batch 8 x accum 4 keeps the
+    # global batch at 32 within 24 GB.
+    batch_size: 8
     val_batch_size: 1
 
 trainer:
   params:
     compute_validation_metrics: false
     ema_rate: 0.9999
-    train_adapters_only: true
+    train_adapters_only: false
     garment_encoder_name: facebook/dinov2-small
-    garment_encoder_trainable_blocks: 12
+    # Frozen: no gradients, no optimizer state, no retained DINO activations.
+    garment_encoder_trainable_blocks: 0
     garment_encoder_input_size: [448, 336]
-    garment_encoder_gradient_checkpointing: true
-    garment_encoder_lr: 5.0e-6
+    garment_encoder_gradient_checkpointing: false
     sample_kwargs:
-      num_steps: 8
+      num_steps: 30
       cfg_scale: 1.5
       adaptive: false
       progress: false
@@ -38,5 +47,5 @@ train_params:
   max_steps: 100000
   accumulate_grad_batches: 4
   limit_val_batches: 1
-  val_check_interval: 1000
+  val_check_interval: 500
   precision: bf16-mixed
