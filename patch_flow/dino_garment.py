@@ -10,6 +10,7 @@ class TrainableDinoGarmentEncoder(nn.Module):
         model_name="facebook/dinov2-small",
         trainable_blocks=2,
         input_size=(448, 336),
+        gradient_checkpointing=False,
     ):
         super().__init__()
         self.model_name = str(model_name)
@@ -21,10 +22,15 @@ class TrainableDinoGarmentEncoder(nn.Module):
             raise ValueError(f"trainable_blocks must be in [0, {len(layers)}]")
 
         self.model.requires_grad_(False)
-        if self.trainable_blocks > 0:
+        self.full_finetune = self.trainable_blocks == len(layers)
+        if self.full_finetune:
+            self.model.requires_grad_(True)
+        elif self.trainable_blocks > 0:
             for layer in layers[-self.trainable_blocks :]:
                 layer.requires_grad_(True)
             self.model.layernorm.requires_grad_(True)
+        if gradient_checkpointing and self.trainable_blocks > 0:
+            self.model.gradient_checkpointing_enable()
 
         patch_size = int(self.model.config.patch_size)
         if any(size % patch_size for size in self.input_size):
@@ -44,6 +50,8 @@ class TrainableDinoGarmentEncoder(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
+        if self.full_finetune:
+            return self
         self.model.eval()
         if mode and self.trainable_blocks > 0:
             for layer in self.model.encoder.layer[-self.trainable_blocks :]:

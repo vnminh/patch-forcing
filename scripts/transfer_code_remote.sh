@@ -5,7 +5,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
 remote_host=${REMOTE_HOST:-root@199.126.134.31}
 remote_port=${REMOTE_PORT:-29644}
-remote_root=${REMOTE_ROOT:-/workspace/pft-vton}
+remote_root=${REMOTE_ROOT:-/workspace}
 remote_repo="$remote_root/patch-forcing"
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
@@ -37,8 +37,8 @@ if [[ "$remote_host" =~ [[:space:]] || ! "$remote_root" =~ ^/[A-Za-z0-9._/-]+$ ]
     exit 2
 fi
 
-ssh_args=(-p "$remote_port" -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=6)
-rsync_ssh="ssh -p $remote_port -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=6"
+ssh_args=(-p "$remote_port" -o ClearAllForwardings=yes -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=6)
+rsync_ssh="ssh -p $remote_port -o ClearAllForwardings=yes -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=6"
 rsync_args=(-a --human-readable --info=progress2 --partial --append-verify)
 if [[ ${DRY_RUN:-0} == 1 ]]; then
     rsync_args+=(--dry-run)
@@ -62,4 +62,3 @@ rsync "${rsync_args[@]}" \
     "$repo_root/" "$remote_host:$remote_repo/"
 
 echo "Code transfer complete."
-

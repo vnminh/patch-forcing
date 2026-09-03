@@ -28,13 +28,10 @@ load_strict: True
 # resume_step: 0    # can be used for load_weights to specify step (not required for resume_checkpoint)
 resume_checkpoint: null
 
-# checkpoint saving (lightning callback)
-checkpoint_params:              # filename refers to number of gradient updates
+# checkpoint saving
+checkpoint_params:
     every_n_train_steps: 10000  # gradient update steps
-    save_top_k: -1              # needs to be -1, otherwise it overwrites
-    verbose: True
-    save_last: True
-    auto_insert_metric_name: False
+    save_top_k: 1
 
 # ----------------------------------------
 train_params:

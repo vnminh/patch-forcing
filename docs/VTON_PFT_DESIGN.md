@@ -28,7 +28,7 @@ Person Ip ---> supplied agnostic mask M ---> token dilation
           ---> expanded RGB mask M+ ---> remove garment before VAE
           ---> frozen VAE encoder -------------------------------> agnostic latent za
 
-Garment Ig ---> online DINOv2-small (last two blocks trainable) -> garment feature map fg
+Garment Ig ---> online fully trainable DINOv2-small -----------> garment feature map fg
 Garment mask Mg -------------------------------------------------> garment token key mask
 
 Noise epsilon + z* + za + token times --------------------------> evolving latent xt
@@ -287,7 +287,7 @@ Inside the hard editable region, the explicit agnostic latent is zero. Pose and 
 
 ## 10. Garment conditioning
 
-Each garment is encoded online by DINOv2-small at 448 by 336. Its first ten transformer blocks remain frozen, while the final two blocks and final normalization are trained through the VTON flow loss at a lower learning rate. A learned projection maps the 384-channel 32-by-24 DINO feature grid into the PFT hidden dimension. Garment background tokens are suppressed using the resized garment foreground mask \(M_g\).
+Each garment is encoded online by DINOv2-small at 448 by 336. Its patch embedding, positional parameters, all 12 transformer blocks, and final normalization are trained through the VTON flow loss at a lower learning rate. Gradient checkpointing recomputes DINO activations during backward to reduce memory. A learned projection maps the 384-channel 32-by-24 DINO feature grid into the PFT hidden dimension. Garment background tokens are suppressed using the resized garment foreground mask \(M_g\).
 
 Every fourth transformer block contains garment cross-attention:
 
@@ -483,7 +483,7 @@ This mode is intended to validate data flow, checkpoint transfer, gradients, los
 1. PFT-XL was pretrained on a square grid. The implementation supports 512-by-384 fine-tuning through positional interpolation, but this remains resolution transfer rather than native rectangular pretraining.
 2. One token equals roughly 16 input pixels. This handles small parsing errors but not large category topology changes by itself.
 3. The implementation has no DensePose or explicit pose encoder. It relies on agnostic spatial context and visible body boundaries.
-4. DINO fine-tuning is restricted to its last two blocks for memory and stability. Exact readable text remains bounded by the garment token grid and frozen VAE decoder quality.
+4. Full DINO fine-tuning improves adaptation to garment color and typography but costs more memory and can forget its pretrained representation. Exact readable text remains bounded by the 14-pixel DINO patch grid and frozen VAE decoder quality.
 5. Adaptive uncertainty is meaningful only after the head has been trained on the VTON distribution.
 6. Unpaired validation has no pixel-aligned ground truth. It should be judged qualitatively or with garment/person-specific metrics, not SSIM against the input person.
 

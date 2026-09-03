@@ -21,11 +21,12 @@ data:
 trainer:
   params:
     compute_validation_metrics: false
-    ema_rate: 0.0
+    ema_rate: 0.9999
     train_adapters_only: true
     garment_encoder_name: facebook/dinov2-small
-    garment_encoder_trainable_blocks: 2
+    garment_encoder_trainable_blocks: 12
     garment_encoder_input_size: [448, 336]
+    garment_encoder_gradient_checkpointing: true
     garment_encoder_lr: 5.0e-6
     sample_kwargs:
       num_steps: 8

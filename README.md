@@ -281,7 +281,9 @@ python train.py experiment=viton-pft-xl-smoke16gb \
 
 `max_steps` and `val_check_interval` count optimizer updates. With `accumulate_grad_batches=4`, one optimizer update consumes four mini-batches.
 
-The 512-by-384 experiment encodes garments online with DINOv2-small at 448 by 336. The first ten DINO blocks remain frozen; the final two blocks and output normalization are optimized at a separate low learning rate. Cached garment features and `VITONHD_DINO_DIR` are not used.
+`checkpoint_params.save_top_k` controls checkpoint retention. Its default value of `1` keeps only the newest numbered checkpoint, with `checkpoints/last.ckpt` pointing to it.
+
+The 512-by-384 experiment encodes garments online with DINOv2-small at 448 by 336. Its patch embedding, all 12 transformer blocks, and output normalization are optimized at a separate low learning rate. DINO gradient checkpointing limits activation memory. Cached garment features and `VITONHD_DINO_DIR` are not used.
 
 
 ## 🎓 Citation

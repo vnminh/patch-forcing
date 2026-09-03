@@ -26,6 +26,7 @@ params:
   garment_encoder_name: facebook/dinov2-small
   garment_encoder_trainable_blocks: 2
   garment_encoder_input_size: [448, 336]
+  garment_encoder_gradient_checkpointing: false
   garment_encoder_lr: 5.0e-6
   train_adapters_only: false
   save_validation_previews: true

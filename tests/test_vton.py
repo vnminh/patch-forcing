@@ -38,6 +38,7 @@ class VTONTests(unittest.TestCase):
                 super().__init__()
                 self.encoder = torch.nn.Module()
                 self.encoder.layer = torch.nn.ModuleList([torch.nn.Linear(4, 4) for _ in range(12)])
+                self.embeddings = torch.nn.Linear(4, 4)
                 self.layernorm = torch.nn.LayerNorm(4)
                 self.config = SimpleNamespace(patch_size=14, hidden_size=4)
 
@@ -48,6 +49,20 @@ class VTONTests(unittest.TestCase):
         self.assertTrue(all(not parameter.requires_grad for layer in frozen for parameter in layer.parameters()))
         self.assertTrue(all(parameter.requires_grad for layer in trainable for parameter in layer.parameters()))
         self.assertTrue(all(parameter.requires_grad for parameter in encoder.model.layernorm.parameters()))
+
+    def test_full_dino_finetuning_includes_embeddings(self):
+        class FakeDino(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = torch.nn.Module()
+                self.encoder.layer = torch.nn.ModuleList([torch.nn.Linear(4, 4) for _ in range(12)])
+                self.embeddings = torch.nn.Linear(4, 4)
+                self.layernorm = torch.nn.LayerNorm(4)
+                self.config = SimpleNamespace(patch_size=14, hidden_size=4)
+
+        with patch("patch_flow.dino_garment.Dinov2Model.from_pretrained", return_value=FakeDino()):
+            encoder = TrainableDinoGarmentEncoder(trainable_blocks=12)
+        self.assertTrue(all(parameter.requires_grad for parameter in encoder.model.parameters()))
 
     def test_preview_sample_is_moved_to_front(self):
         with TemporaryDirectory() as directory:

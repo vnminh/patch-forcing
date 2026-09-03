@@ -22,6 +22,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         garment_encoder_name="facebook/dinov2-small",
         garment_encoder_trainable_blocks=2,
         garment_encoder_input_size=(448, 336),
+        garment_encoder_gradient_checkpointing=False,
         garment_encoder_lr=5e-6,
         train_adapters_only=False,
         backbone_lr_multiplier=0.1,
@@ -39,6 +40,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             model_name=garment_encoder_name,
             trainable_blocks=garment_encoder_trainable_blocks,
             input_size=garment_encoder_input_size,
+            gradient_checkpointing=garment_encoder_gradient_checkpointing,
         )
         if self.garment_encoder.feature_dim != self.model.garment_feature_dim:
             raise ValueError(

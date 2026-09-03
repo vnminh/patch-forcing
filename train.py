@@ -459,7 +459,6 @@ def main(cfg: DictConfig):
                 }
                 torch.save(checkpoint, fn)
                 print(f"Save checkpoint to {fn}")
-                # symlink latest checkpoint
                 last_ckpt_symlink = os.path.join(ckpt_dir, "last.ckpt")
                 try:
                     if os.path.islink(last_ckpt_symlink) or os.path.exists(last_ckpt_symlink):
@@ -468,6 +467,22 @@ def main(cfg: DictConfig):
                     os.symlink(relative_ckpt_path, last_ckpt_symlink)
                 except OSError as e:
                     print(f"Failed to update symlink for last.ckpt: {e}")
+
+                save_top_k = int(cfg.checkpoint_params.get("save_top_k", -1))
+                if save_top_k > 0:
+                    step_checkpoints = sorted(
+                        (
+                            os.path.join(ckpt_dir, filename)
+                            for filename in os.listdir(ckpt_dir)
+                            if filename.startswith("step")
+                            and filename.endswith(".ckpt")
+                            and filename[4:-5].isdigit()
+                        ),
+                        key=lambda path: int(os.path.basename(path)[4:-5]),
+                        reverse=True,
+                    )
+                    for stale_checkpoint in step_checkpoints[save_top_k:]:
+                        os.remove(stale_checkpoint)
                 lightning_module.train()
             accelerator.wait_for_everyone()
 
