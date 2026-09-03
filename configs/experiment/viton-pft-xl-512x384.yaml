@@ -15,10 +15,11 @@ model:
     # SD-VAE encoder taps: 1/4 resolution has 256 channels, 1/2 resolution has 128.
     garment_middle_channels: 256
     garment_detail_channels: 128
-    # Blocks 4, 8, 12, 16, 20, 24, 28. Correspondence first (dino/coarse), appearance
-    # transport last (detail), so fine structure is written close to the output and is
-    # not washed out by the remaining blocks.
-    garment_scale_routes: [dino, dino, coarse, middle, middle, detail, detail]
+    # Inject garment evidence every two blocks. Semantic correspondence is established
+    # first, then increasingly fine appearance features carry colour, logos, and text.
+    cross_attention_every: 2
+    garment_scale_routes: [dino, dino, coarse, coarse, middle, middle, middle, middle,
+                            detail, detail, detail, detail, detail, detail]
 
 data:
   params:
@@ -46,6 +47,7 @@ trainer:
 train_params:
   max_steps: 100000
   accumulate_grad_batches: 4
+  garment_grad_log_every_n_steps: 50
   limit_val_batches: 1
   val_check_interval: 500
   precision: bf16-mixed

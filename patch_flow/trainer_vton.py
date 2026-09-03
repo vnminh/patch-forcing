@@ -100,6 +100,47 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             output["lr_scheduler"] = load_partial_from_config(self.lr_scheduler_cfg)(optimizer=optimizer)
         return output
 
+    @staticmethod
+    def _gradient_norm(parameter, row_slice=None):
+        if parameter is None or parameter.grad is None:
+            return torch.zeros((), device=parameter.device if parameter is not None else "cpu")
+        gradient = parameter.grad.detach()
+        if row_slice is not None:
+            gradient = gradient[row_slice]
+        return torch.linalg.vector_norm(gradient.float())
+
+    @torch.no_grad()
+    def garment_gradient_norms(self):
+        """Return pre-clipping gradient norms for every garment-conditioning path."""
+        metrics = {}
+        for block_index, block in enumerate(self.model.blocks, start=1):
+            if not block.use_garment_cross_attention:
+                continue
+            attention = block.garment_cross_attention
+            prefix = f"garment_grad/block_{block_index:02d}_{block.garment_scale}"
+            metrics[f"{prefix}/out_proj"] = self._gradient_norm(attention.out_proj.weight)
+            qkv_rows = attention.embed_dim
+            metrics[f"{prefix}/q"] = self._gradient_norm(
+                attention.in_proj_weight, slice(0, qkv_rows)
+            )
+            metrics[f"{prefix}/k"] = self._gradient_norm(
+                attention.in_proj_weight, slice(qkv_rows, 2 * qkv_rows)
+            )
+            metrics[f"{prefix}/v"] = self._gradient_norm(
+                attention.in_proj_weight, slice(2 * qkv_rows, 3 * qkv_rows)
+            )
+
+        embedders = {
+            "dino": self.model.garment_feature_proj,
+            "coarse": self.model.garment_embedder.proj if self.model.garment_embedder is not None else None,
+            "middle": self.model.garment_middle_embedder,
+            "detail": self.model.garment_detail_embedder,
+        }
+        for name, embedder in embedders.items():
+            if embedder is not None:
+                metrics[f"garment_grad/embedder_{name}"] = self._gradient_norm(embedder.weight)
+        return metrics
+
     def _label(self, batch, batch_size, device):
         label = batch.get("label")
         if label is not None:

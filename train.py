@@ -390,6 +390,20 @@ def main(cfg: DictConfig):
                 with profile_record_fn(f"step_{global_step}/bwd"):
                     accelerator.backward(loss)
 
+                garment_grad_norms = {}
+                garment_grad_log_interval = int(
+                    cfg.train_params.get("garment_grad_log_every_n_steps", 0)
+                )
+                should_log_garment_grads = (
+                    garment_grad_log_interval > 0
+                    and (global_step + 1) % garment_grad_log_interval == 0
+                )
+                if accelerator.sync_gradients and should_log_garment_grads:
+                    unwrapped_module = unwrap_model(module)
+                    gradient_metrics_fn = getattr(unwrapped_module, "garment_gradient_norms", None)
+                    if gradient_metrics_fn is not None:
+                        garment_grad_norms = gradient_metrics_fn()
+
                 # optimizer step
                 with profile_record_fn(f"step_{global_step}/opt"):
                     if accelerator.sync_gradients:
@@ -413,6 +427,8 @@ def main(cfg: DictConfig):
             for k, v in loss_dict.items():
                 logger.add_scalar(f"train/{k}", v.item(), global_step=global_step)
             logger.add_scalar("train/grad_norm", grad_norm.item(), global_step=global_step)
+            for k, v in garment_grad_norms.items():
+                logger.add_scalar(f"train/{k}", v.item(), global_step=global_step)
             logger.add_scalar("train/step_time", step_time, global_step=global_step)
             logger.add_scalar("train/it_per_sec", 1.0 / step_time, global_step=global_step)
             logger.add_scalar("train/throughput", bs / step_time, global_step=global_step)

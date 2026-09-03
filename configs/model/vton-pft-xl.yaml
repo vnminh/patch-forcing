@@ -17,5 +17,7 @@ params:
   garment_detail_channels: null
   garment_scale_routes: null
   garment_embed_gain: 1.0
+  # Small residual initialization wakes Q/K/V and garment feature projections on step 1.
+  garment_attention_output_init_std: 1.0e-3
   cross_attention_every: 4
   pretrained_ckpt: ${oc.env:PFT_XL_CKPT,null}

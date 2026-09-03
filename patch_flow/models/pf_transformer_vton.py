@@ -10,7 +10,14 @@ GARMENT_SCALES = ("dino", "coarse", "middle", "detail")
 
 
 class VTONPatchForcingBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, garment_scale=None):
+    def __init__(
+        self,
+        hidden_size,
+        num_heads,
+        mlp_ratio=4.0,
+        garment_scale=None,
+        garment_attention_output_init_std=1e-3,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True)
@@ -29,6 +36,8 @@ class VTONPatchForcingBlock(nn.Module):
         self.garment_scale = garment_scale
         self.use_garment_cross_attention = garment_scale is not None
         if self.use_garment_cross_attention:
+            if garment_attention_output_init_std <= 0:
+                raise ValueError("garment_attention_output_init_std must be positive")
             self.garment_norm = nn.LayerNorm(hidden_size, eps=1e-6)
             self.garment_cross_attention = nn.MultiheadAttention(
                 hidden_size,
@@ -36,7 +45,12 @@ class VTONPatchForcingBlock(nn.Module):
                 dropout=0.0,
                 batch_first=True,
             )
-            nn.init.zeros_(self.garment_cross_attention.out_proj.weight)
+            # A small non-zero residual keeps the pretrained backbone nearly unchanged
+            # while allowing Q/K/V and garment embedders to learn from the first step.
+            nn.init.normal_(
+                self.garment_cross_attention.out_proj.weight,
+                std=float(garment_attention_output_init_std),
+            )
             nn.init.zeros_(self.garment_cross_attention.out_proj.bias)
 
     def forward(self, x, c, garment_tokens=None, garment_padding_mask=None, edit_token_mask=None):
@@ -83,6 +97,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_detail_channels=None,
         garment_scale_routes=None,
         garment_embed_gain=1.0,
+        garment_attention_output_init_std=1e-3,
         cross_attention_every=4,
         gradient_checkpointing=False,
         pretrained_ckpt=None,
@@ -109,6 +124,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         self.garment_middle_channels = None if garment_middle_channels is None else int(garment_middle_channels)
         self.garment_detail_channels = None if garment_detail_channels is None else int(garment_detail_channels)
         self.garment_embed_gain = float(garment_embed_gain)
+        self.garment_attention_output_init_std = float(garment_attention_output_init_std)
         self.cross_attention_every = cross_attention_every
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.x_embedder = PatchEmbed(
@@ -126,9 +142,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         if self.use_dino_garment:
             self.garment_feature_norm = nn.LayerNorm(self.garment_feature_dim)
             self.garment_feature_proj = nn.Linear(self.garment_feature_dim, self.hidden_size, bias=True)
-            # Unit gain: the cross-attention output projection is already zero-initialised, so
-            # attenuating the keys here only flattens the attention logits into a uniform
-            # average over every garment token.
+            # Unit gain avoids flattening the attention logits into a uniform average over
+            # every garment token; the output projection separately uses a small residual init.
             nn.init.xavier_uniform_(self.garment_feature_proj.weight, gain=self.garment_embed_gain)
             nn.init.zeros_(self.garment_feature_proj.bias)
             # DINO supplies its own positional encoding, so the DiT grid embedding is optional.
@@ -182,6 +197,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 self.hidden_size,
                 self.num_heads,
                 garment_scale=garment_scale,
+                garment_attention_output_init_std=self.garment_attention_output_init_std,
             )
             block.load_state_dict(old_block.state_dict(), strict=False)
             self.blocks.append(block)

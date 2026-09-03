@@ -17,7 +17,9 @@ model:
     gradient_checkpointing: true
     garment_middle_channels: 256
     garment_detail_channels: 128
-    garment_scale_routes: [dino, dino, coarse, middle, middle, detail, detail]
+    cross_attention_every: 2
+    garment_scale_routes: [dino, dino, coarse, coarse, middle, middle, middle, middle,
+                            detail, detail, detail, detail, detail, detail]
 
 trainer:
   params:
@@ -41,6 +43,7 @@ checkpoint_params:
 train_params:
   max_steps: 1000
   accumulate_grad_batches: 4
+  garment_grad_log_every_n_steps: 5
   limit_val_batches: 1
   val_check_interval: 5
   validation_steps: []

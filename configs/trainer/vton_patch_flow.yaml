@@ -8,7 +8,7 @@ params:
       patch_size: 2
       # Garment-forcing: pure noise in the edit region, so the model must read the
       # garment condition instead of the partially clean paired target.
-      zero_time_probability: 0.1
+      zero_time_probability: 0.35
       # Detail-refinement coverage: ceiling pinned at t=1. Without this the LTG ceiling
       # sigma(loc+z) starves t>0.9, which is exactly where logo and text detail is written.
       high_time_probability: 0.25
@@ -28,7 +28,7 @@ params:
   outside_velocity_weight: 0.01
   # Optional first-difference L1 on the predicted clean latent; set to ~0.05 to push
   # high-frequency garment structure harder.
-  detail_loss_weight: 0.0
+  detail_loss_weight: 0.05
   garment_dropout_prob: 0.1
   use_dino_garment: true
   garment_encoder_name: facebook/dinov2-small

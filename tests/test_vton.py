@@ -10,6 +10,7 @@ from patch_flow.flow_vton import VTONPatchFlowForcing
 from patch_flow.dino_garment import TrainableDinoGarmentEncoder
 from patch_flow.models.pf_transformer import PatchForcingDiT
 from patch_flow.models.pf_transformer_vton import VTONPatchForcingDiT
+from patch_flow.trainer_vton import LatentVTONPatchForcingTrainer
 from patch_flow.vton_utils import compose_vton, prepare_vton_masks
 from patch_flow.vton_data import VTONHDDataset
 from train import repeat_dataloader
@@ -235,11 +236,6 @@ class VTONTests(unittest.TestCase):
         model = self._multiscale_model().train()
         with torch.no_grad():
             model.final_layer.linear.weight.normal_(std=0.01)
-            # out_proj is zero-initialised, which by design blocks gradient to the
-            # garment keys and values until it becomes non-zero.
-            for block in model.blocks:
-                if block.use_garment_cross_attention:
-                    block.garment_cross_attention.out_proj.weight.normal_(std=0.01)
         latent = torch.randn(1, 4, 8, 6)
         mask = torch.ones(1, 1, 8, 6)
         output = model(
@@ -264,6 +260,45 @@ class VTONTests(unittest.TestCase):
         ):
             self.assertIsNotNone(parameter.grad, f"{name} branch received no gradient")
             self.assertGreater(parameter.grad.abs().sum().item(), 0, f"{name} branch gradient is zero")
+
+    def test_garment_gradient_metrics_cover_attention_and_embedders(self):
+        model = self._multiscale_model().train()
+        with torch.no_grad():
+            model.final_layer.linear.weight.normal_(std=0.01)
+        latent = torch.randn(1, 4, 8, 6)
+        mask = torch.ones(1, 1, 8, 6)
+        output = model(
+            latent,
+            torch.rand(1, 12),
+            torch.zeros(1, dtype=torch.long),
+            person_agnostic=torch.randn_like(latent),
+            person_mask=mask,
+            edit_mask=mask,
+            garment_features=torch.randn(1, 32, 5, 4),
+            garment=torch.randn(1, 4, 8, 6),
+            garment_middle=torch.randn(1, 16, 16, 12),
+            garment_detail=torch.randn(1, 8, 32, 24),
+            garment_mask=mask,
+        )
+        output.square().mean().backward()
+
+        trainer = object.__new__(LatentVTONPatchForcingTrainer)
+        trainer.__dict__["model"] = model
+        metrics = LatentVTONPatchForcingTrainer.garment_gradient_norms(trainer)
+        for block_index, scale in enumerate(("dino", "coarse", "middle", "detail"), start=1):
+            prefix = f"garment_grad/block_{block_index:02d}_{scale}"
+            for projection in ("out_proj", "q", "k", "v"):
+                self.assertIn(f"{prefix}/{projection}", metrics)
+                self.assertGreater(metrics[f"{prefix}/{projection}"].item(), 0)
+        for scale in ("dino", "coarse", "middle", "detail"):
+            self.assertGreater(metrics[f"garment_grad/embedder_{scale}"].item(), 0)
+
+    def test_garment_attention_uses_small_nonzero_output_initialization(self):
+        model = self._multiscale_model(garment_attention_output_init_std=1e-3)
+        for block in model.blocks:
+            weight = block.garment_cross_attention.out_proj.weight
+            self.assertGreater(weight.abs().sum().item(), 0)
+            self.assertLess(weight.std().item(), 2e-3)
 
     def test_detail_branch_keeps_its_finer_token_grid(self):
         model = self._multiscale_model().eval()
