@@ -83,7 +83,10 @@ class VTONPatchForcingBlock(nn.Module):
         if return_attention:
             if attention is None:
                 raise RuntimeError("Attention weights were requested from a block without garment cross-attention")
-            return x, attention
+            # Return the actual residual written by A @ V followed by out_proj.  Losses
+            # on ``attention`` alone can train Q/K routing but cannot teach V/out_proj to
+            # transport garment content such as logos and texture.
+            return x, attention, cross
         return x
 
 
@@ -450,12 +453,13 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             else:
                 output = block(x, cond, block_tokens, block_padding_mask, edit_token_mask, want_attention)
             if want_attention:
-                x, weights = output
+                x, weights, transported_value = output
                 attention_maps.append(
                     {
                         "block": index,
                         "scale": block.garment_scale,
                         "weights": weights,
+                        "output": transported_value,
                         "grid": garment_grids[block.garment_scale],
                         "key_padding": block_padding_mask,
                     }

@@ -261,15 +261,16 @@ def neighbourhood_mass(attention, target, grid, radius):
 
 
 class CorrespondenceAttentionLoss(nn.Module):
-    """Target-mass, centre-of-mass, entropy and photometric losses on garment attention."""
+    """Position, routing-appearance and transported-value losses on garment attention."""
 
     def __init__(
         self,
         center_weight=0.25,
         entropy_weight=0.05,
-        nll_weight=1.0,
+        nll_weight=0.3,
         nll_radius=0.05,
         photometric_weight=1.0,
+        value_weight=0.0,
         entropy_eps=1e-8,
     ):
         super().__init__()
@@ -283,7 +284,10 @@ class CorrespondenceAttentionLoss(nn.Module):
         else:
             self.nll_radius = float(nll_radius)
         self.photometric_weight = float(photometric_weight)
+        self.value_weight = float(value_weight)
         self.entropy_eps = float(entropy_eps)
+        if self.value_weight < 0:
+            raise ValueError("value_weight must be non-negative")
         radii = self.nll_radius.values() if isinstance(self.nll_radius, dict) else (self.nll_radius,)
         if any(not 0 < radius < 1 for radius in radii):
             raise ValueError("nll_radius values are in normalised garment units and must be in (0, 1)")
@@ -311,9 +315,18 @@ class CorrespondenceAttentionLoss(nn.Module):
             self.needs_target
             or self.entropy_weight > 0
             or self.photometric_weight > 0
+            or self.value_weight > 0
         )
 
-    def forward(self, attention_maps, target=None, weight=None, appearance=None, appearance_weight=None):
+    def forward(
+        self,
+        attention_maps,
+        target=None,
+        weight=None,
+        appearance=None,
+        appearance_weight=None,
+        value_targets=None,
+    ):
         """``attention_maps`` is the list returned by ``VTONPatchForcingDiT``.
 
         ``target``/``weight`` drive the teacher-based terms; ``appearance`` carries
@@ -334,8 +347,21 @@ class CorrespondenceAttentionLoss(nn.Module):
         use_photometric = (
             appearance is not None and appearance_weight is not None and self.photometric_weight > 0
         )
+        use_value = value_targets is not None and appearance_weight is not None and self.value_weight > 0
+        prepared_value_targets = (
+            {scale: value.detach().float() for scale, value in value_targets.items()}
+            if use_value
+            else None
+        )
 
-        totals = {"center": zero, "entropy": zero, "nll": zero, "photometric": zero, "mass": zero}
+        totals = {
+            "center": zero,
+            "entropy": zero,
+            "nll": zero,
+            "photometric": zero,
+            "value": zero,
+            "mass": zero,
+        }
         scale_totals = {}
         metrics = {}
         for entry in attention_maps:
@@ -349,6 +375,7 @@ class CorrespondenceAttentionLoss(nn.Module):
                     "entropy": zero,
                     "nll": zero,
                     "photometric": zero,
+                    "value": zero,
                     "mass": zero,
                     "count": 0,
                 }
@@ -416,6 +443,34 @@ class CorrespondenceAttentionLoss(nn.Module):
                 )
                 metrics[f"{prefix}/photometric"] = photometric_loss.detach()
 
+            if use_value:
+                transported = entry.get("output")
+                if transported is None:
+                    raise ValueError(
+                        f"Branch '{scale}' did not return its transported value for value supervision"
+                    )
+                if scale not in prepared_value_targets:
+                    raise ValueError(f"No target-person value feature was provided for scale '{scale}'")
+                value_target = prepared_value_targets[scale]
+                if value_target.device != device:
+                    value_target = value_target.to(device)
+                transported = transported.float()
+                if transported.shape != value_target.shape:
+                    raise ValueError(
+                        f"Transported value shape {tuple(transported.shape)} does not match "
+                        f"the '{scale}' target shape {tuple(value_target.shape)}"
+                    )
+                # Direction, rather than magnitude, is supervised: the cross-attention
+                # residual has a backbone-dependent scale, while both tensors share the
+                # same SD-VAE/embedder feature basis. Unlike RGB routing, this term goes
+                # through the real V projection and output projection.
+                value_error = 1 - F.cosine_similarity(transported, value_target, dim=-1)
+                value_denominator = appearance_weight.sum().clamp_min(1e-6)
+                value_loss = (value_error * appearance_weight).sum() / value_denominator
+                totals["value"] = totals["value"] + value_loss
+                scale_totals[scale]["value"] = scale_totals[scale]["value"] + value_loss
+                metrics[f"{prefix}/value"] = value_loss.detach()
+
         count = len(attention_maps)
         for key in totals:
             totals[key] = totals[key] / count
@@ -426,6 +481,7 @@ class CorrespondenceAttentionLoss(nn.Module):
             metrics[f"correspondence/{scale}/center"] = averaged["center"].detach()
             metrics[f"correspondence/{scale}/entropy"] = averaged["entropy"].detach()
             metrics[f"correspondence/{scale}/photometric"] = averaged["photometric"].detach()
+            metrics[f"correspondence/{scale}/value"] = averaged["value"].detach()
             metrics[f"correspondence/{scale}/target_mass"] = averaged["mass"].detach()
             metrics[f"correspondence/{scale}/appearance_error"] = (
                 averaged["photometric"].detach().clamp_min(0).sqrt()
@@ -435,11 +491,13 @@ class CorrespondenceAttentionLoss(nn.Module):
             + self.center_weight * totals["center"]
             + self.entropy_weight * totals["entropy"]
             + self.photometric_weight * totals["photometric"]
+            + self.value_weight * totals["value"]
         )
         metrics["correspondence_nll"] = totals["nll"].detach()
         metrics["correspondence_center_loss"] = totals["center"].detach()
         metrics["correspondence_entropy"] = totals["entropy"].detach()
         metrics["correspondence_photometric"] = totals["photometric"].detach()
+        metrics["correspondence_value"] = totals["value"].detach()
         # Directly interpretable: mass actually landing on the target, and the retrieved
         # appearance error in the same RGB units the diagnostics report.
         metrics["correspondence_target_mass"] = totals["mass"].detach()

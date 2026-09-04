@@ -42,6 +42,7 @@ trainer:
       coarse: 0.04
       middle: 0.03
       detail: 0.025
+    correspondence_value_weight: 0.25
     correspondence_warmup_steps: 1000
     sample_kwargs:
       num_steps: 30
@@ -54,5 +55,5 @@ train_params:
   accumulate_grad_batches: 4
   garment_grad_log_every_n_steps: 50
   limit_val_batches: 1
-  val_check_interval: 500
+  val_check_interval: 100
   precision: bf16-mixed

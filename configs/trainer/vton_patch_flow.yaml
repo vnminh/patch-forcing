@@ -39,7 +39,7 @@ params:
   # matched key, i.e. constrain WHICH keys are attended to. Watch
   # train/correspondence_target_mass -- measured before this term existed it was 0.05 for
   # coarse and 0.005 for detail, meaning essentially no mass on the target.
-  correspondence_nll_weight: 1.0
+  correspondence_nll_weight: 0.3
   # Radius in normalised garment units. It may be a scalar shared by every branch or a
   # mapping keyed by garment scale. The 512x384 experiment overrides it per scale.
   correspondence_nll_radius: 0.05
@@ -57,6 +57,10 @@ params:
   # colour signal has to be asked for directly. Watch
   # train/correspondence_appearance_error (0.817 = the garment-mean failure mode).
   correspondence_photometric_weight: 1.0
+  # Cosine alignment between the actual cross-attention residual OutProj(A @ V) and
+  # target-person SD-VAE features. Unlike every attention-map loss above, this directly
+  # trains the V and output projections that must carry logos and texture.
+  correspondence_value_weight: 0.0
   correspondence_teacher_name: facebook/dinov3-vits16-pretrain-lvd1689m
   # null keeps the dataset resolution (rounded to the teacher patch grid), so the
   # letterboxed aspect ratio is preserved and matched positions are not sheared.

@@ -24,9 +24,10 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         garment_dropout_prob=0.1,
         correspondence_center_weight=0.25,
         correspondence_entropy_weight=0.05,
-        correspondence_nll_weight=1.0,
+        correspondence_nll_weight=0.3,
         correspondence_nll_radius=0.05,
         correspondence_photometric_weight=1.0,
+        correspondence_value_weight=0.0,
         correspondence_teacher_name="facebook/dinov3-vits16-pretrain-lvd1689m",
         correspondence_teacher_input_size=(512, 384),
         correspondence_garment_grid=None,
@@ -62,6 +63,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             nll_weight=correspondence_nll_weight,
             nll_radius=correspondence_nll_radius,
             photometric_weight=correspondence_photometric_weight,
+            value_weight=correspondence_value_weight,
         )
         self.correspondence_min_similarity = float(correspondence_min_similarity)
         self.correspondence_soft_target_temperature = float(correspondence_soft_target_temperature)
@@ -177,6 +179,23 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         target = batch["image"]
         garment = batch["garment"]
         target_latent = batch.get("latent")
+        target_middle = batch.get("target_middle")
+        target_detail = batch.get("target_detail")
+        supervised_scales = set(
+            self.correspondence_scales
+            if self.correspondence_scales is not None
+            else getattr(self.model, "_enabled_scales")()
+        )
+        needs_target_pyramid = (
+            self.correspondence_loss.value_weight > 0
+            and self.use_multiscale_garment
+            and bool(supervised_scales & {"middle", "detail"})
+            and (target_middle is None or target_detail is None)
+        )
+        if needs_target_pyramid:
+            pyramid_latent, target_middle, target_detail = encode_vae_pyramid(self.first_stage, target)
+            if target_latent is None:
+                target_latent = pyramid_latent
         if target_latent is None:
             target_latent = self.encode(target)
         # A single mask: the token grid is already the finest editable granularity, so the
@@ -204,6 +223,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             "person_image": batch.get("person", target),
             "agnostic_image": batch["person_agnostic"],
             "target": target_latent,
+            "target_middle": target_middle,
+            "target_detail": target_detail,
             "person_context": person_context,
             "masks": masks,
             "garment": garment_latent,
@@ -300,6 +321,40 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             weight = weight * keep[:, None].to(weight.dtype)
         return {"query": query, "garment": batch["garment"]}, weight
 
+    @torch.no_grad()
+    def _target_value_features(self, encoded):
+        """Content-only target-person tokens in the same SD-VAE feature basis as garment.
+
+        No positional embedding is added: position is already supervised by CORAL, while
+        this target must retain the appearance direction needed by V and out_proj.
+        """
+        query_grid = self._person_token_grid(encoded["target"])
+        configured = set(
+            self.correspondence_scales
+            if self.correspondence_scales is not None
+            else self.model._enabled_scales()
+        )
+        targets = {}
+        if "coarse" in configured:
+            if self.model.garment_embedder is None:
+                raise ValueError("Coarse value supervision requires the coarse garment embedder")
+            tokens = self.model.garment_embedder(encoded["target"])
+            targets["coarse"] = self.model._normalize_garment_tokens("coarse", tokens).detach()
+
+        for scale in ("middle", "detail"):
+            if scale not in configured:
+                continue
+            source = encoded[f"target_{scale}"]
+            embedder = getattr(self.model, f"garment_{scale}_embedder")
+            if source is None or embedder is None:
+                raise ValueError(f"{scale.capitalize()} value supervision requires target SD-VAE features")
+            embedded = embedder(source)
+            if embedded.shape[-2:] != query_grid:
+                embedded = F.adaptive_avg_pool2d(embedded, query_grid)
+            tokens = embedded.flatten(2).transpose(1, 2)
+            targets[scale] = self.model._normalize_garment_tokens(scale, tokens).detach()
+        return targets
+
     @staticmethod
     def _detail_loss(predicted, target, mask):
         """L1 on first spatial differences: penalises washed-out high-frequency structure
@@ -377,6 +432,11 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             metrics["detail_loss"] = detail_loss
         if attention_maps:
             appearance, appearance_weight = self._appearance_targets(batch, encoded, masks.token, keep)
+            value_targets = (
+                self._target_value_features(encoded)
+                if self.correspondence_loss.value_weight > 0
+                else None
+            )
             correspondence_target = correspondence_weight = similarity = None
             if self.correspondence_teacher is not None:
                 correspondence_target, correspondence_weight, similarity = self._correspondence_targets(
@@ -388,6 +448,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 correspondence_weight,
                 appearance=appearance,
                 appearance_weight=appearance_weight,
+                value_targets=value_targets,
             )
             ramp = self._correspondence_ramp()
             loss = loss + ramp * correspondence_loss

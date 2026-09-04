@@ -357,6 +357,40 @@ class VTONTests(unittest.TestCase):
         self.assertIn("correspondence/middle/nll", metrics)
         self.assertIn("correspondence/middle/entropy", metrics)
 
+    def test_value_transport_loss_matches_actual_cross_attention_output(self):
+        grid = (1, 2)
+        attention = torch.tensor([[[0.5, 0.5], [0.5, 0.5]]])
+        value_target = torch.randn(1, 2, 8)
+        only_value = CorrespondenceAttentionLoss(
+            center_weight=0.0,
+            entropy_weight=0.0,
+            nll_weight=0.0,
+            photometric_weight=0.0,
+            value_weight=1.0,
+        )
+
+        def evaluate(output):
+            maps = [{
+                "block": 1,
+                "scale": "middle",
+                "weights": attention,
+                "output": output,
+                "grid": grid,
+                "key_padding": None,
+            }]
+            return only_value(
+                maps,
+                appearance_weight=torch.ones(1, 2),
+                value_targets={"middle": value_target},
+            )
+
+        correct, metrics = evaluate(value_target.clone())
+        opposite, _ = evaluate(-value_target)
+        self.assertAlmostEqual(correct.item(), 0.0, places=6)
+        self.assertGreater(opposite.item(), 1.9)
+        self.assertAlmostEqual(metrics["correspondence_value"].item(), 0.0, places=6)
+        self.assertIn("correspondence/middle/value", metrics)
+
     def test_photometric_loss_penalises_retrieving_the_garment_mean(self):
         """Exactly the observed defect: every person token retrieving the same average
         colour rather than the colour it needs."""
@@ -803,6 +837,7 @@ class VTONTests(unittest.TestCase):
             height, width = entry["grid"]
             # Queries are always the person token grid; keys follow the branch's own grid.
             self.assertEqual(tuple(entry["weights"].shape), (1, 12, height * width))
+            self.assertEqual(tuple(entry["output"].shape), (1, 12, model.hidden_size))
             torch.testing.assert_close(
                 entry["weights"].sum(-1), torch.ones(1, 12), atol=1e-5, rtol=1e-5
             )
@@ -870,6 +905,41 @@ class VTONTests(unittest.TestCase):
             self.assertIsNotNone(plain)
             self.assertGreater(plain.abs().sum().item(), 0)
             torch.testing.assert_close(checkpointed, plain, rtol=0, atol=0)
+
+    def test_value_transport_loss_reaches_v_and_output_projection(self):
+        torch.manual_seed(0)
+        model = self._multiscale_model(depth=1, garment_scale_routes=["coarse"]).train()
+        mask = torch.ones(1, 1, 8, 6)
+        _, maps = model(
+            x=torch.randn(1, 4, 8, 6),
+            t=torch.rand(1, 12),
+            y=torch.zeros(1, dtype=torch.long),
+            person_agnostic=torch.randn(1, 4, 8, 6),
+            person_mask=mask,
+            edit_mask=mask,
+            garment=torch.randn(1, 4, 8, 6),
+            garment_mask=mask,
+            return_garment_attention=True,
+        )
+        target = torch.randn_like(maps[0]["output"])
+        loss = CorrespondenceAttentionLoss(
+            center_weight=0.0,
+            entropy_weight=0.0,
+            nll_weight=0.0,
+            photometric_weight=0.0,
+            value_weight=1.0,
+        )(
+            maps,
+            appearance_weight=torch.ones(1, 12),
+            value_targets={"coarse": target},
+        )[0]
+        loss.backward()
+
+        attention = model.blocks[0].garment_cross_attention
+        hidden = attention.embed_dim
+        value_gradient = attention.in_proj_weight.grad[2 * hidden :]
+        self.assertGreater(value_gradient.abs().sum().item(), 0)
+        self.assertGreater(attention.out_proj.weight.grad.abs().sum().item(), 0)
 
     def test_correspondence_loss_moves_attention_towards_the_matched_token(self):
         """End to end: the loss reaches the cross-attention parameters and sharpens the
