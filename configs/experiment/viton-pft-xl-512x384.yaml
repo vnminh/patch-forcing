@@ -32,10 +32,14 @@ trainer:
     compute_validation_metrics: false
     ema_rate: 0.9999
     train_adapters_only: false
-    # The detail branch's attention is (B, 768, 3072) per supervised block. Supervising
-    # only the 768-key coarse/middle branches keeps correspondence within the 24 GB
-    # budget; placement is a coarse-scale property anyway.
-    correspondence_scales: [coarse, middle]
+    # The detail branch MUST be supervised: it is routed to 6 of 14 blocks, contributes
+    # the largest share of garment influence (15.6% of the predicted velocity, against
+    # 11.4% middle and 5.1% coarse), and left unsupervised its attention spread over
+    # 500-1060 of 3072 keys with 0.4-0.7% of mass on the target -- a near-uniform average
+    # of the garment, which is precisely the mean-colour path. middle is dropped instead:
+    # its keys were the least region-separable of the three (0.067 in value space against
+    # 0.145 coarse and 0.219 detail).
+    correspondence_scales: [coarse, detail]
     correspondence_warmup_steps: 1000
     sample_kwargs:
       num_steps: 30

@@ -1,6 +1,7 @@
 import os
 
 import torch
+import torch.nn.functional as F
 from torchvision.utils import save_image
 
 from jutils import exists
@@ -21,8 +22,11 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         outside_velocity_weight=0.01,
         detail_loss_weight=0.0,
         garment_dropout_prob=0.1,
-        correspondence_center_weight=1.0,
+        correspondence_center_weight=0.25,
         correspondence_entropy_weight=0.05,
+        correspondence_nll_weight=1.0,
+        correspondence_nll_radius=0.05,
+        correspondence_photometric_weight=1.0,
         correspondence_teacher_name="facebook/dinov3-vits16-pretrain-lvd1689m",
         correspondence_teacher_input_size=(512, 384),
         correspondence_garment_grid=None,
@@ -55,6 +59,9 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         self.correspondence_loss = CorrespondenceAttentionLoss(
             center_weight=correspondence_center_weight,
             entropy_weight=correspondence_entropy_weight,
+            nll_weight=correspondence_nll_weight,
+            nll_radius=correspondence_nll_radius,
+            photometric_weight=correspondence_photometric_weight,
         )
         self.correspondence_min_similarity = float(correspondence_min_similarity)
         self.correspondence_soft_target_temperature = float(correspondence_soft_target_temperature)
@@ -69,8 +76,10 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         # not exist until train.py assigns it after the first optimizer step, or it is a
         # read-only property pinned at 0 because no Trainer is ever attached.
         self._optimizer_steps = 0
+        # The photometric and entropy terms need no teacher, so it is only constructed
+        # when a position target is actually consumed.
         self.correspondence_teacher = None
-        if self.correspondence_loss.enabled:
+        if self.correspondence_loss.needs_target:
             self.correspondence_teacher = DinoCorrespondenceTeacher(
                 model_name=correspondence_teacher_name,
                 input_size=correspondence_teacher_input_size,
@@ -268,6 +277,29 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             weight = weight * keep[:, None].to(weight.dtype)
         return target, weight, similarity
 
+    def _person_token_grid(self, target_latent):
+        return (
+            target_latent.shape[-2] // self.flow.patch_size,
+            target_latent.shape[-1] // self.flow.patch_size,
+        )
+
+    @torch.no_grad()
+    def _appearance_targets(self, batch, encoded, edit_tokens, keep):
+        """Ground-truth worn appearance per person token, plus the garment image.
+
+        RGB rather than latent: it is the space the routing failure was measured in, it is
+        the space a person judges, and garment keys can be pooled to any branch's grid
+        without a second VAE pass. Unlike the position target this needs no teacher and no
+        confidence gate, so it covers every editable token -- including the ones DINOv3
+        was not confident enough to match.
+        """
+        grid = self._person_token_grid(encoded["target"])
+        query = F.adaptive_avg_pool2d(encoded["target_image"].float(), grid).flatten(2).transpose(1, 2)
+        weight = edit_tokens.to(query.dtype)
+        if keep is not None:
+            weight = weight * keep[:, None].to(weight.dtype)
+        return {"query": query, "garment": batch["garment"]}, weight
+
     @staticmethod
     def _detail_loss(predicted, target, mask):
         """L1 on first spatial differences: penalises washed-out high-frequency structure
@@ -297,7 +329,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         )
         label = self._label(batch, target.shape[0], target.device)
         supervise_correspondence = (
-            self.training and self.correspondence_teacher is not None and self._correspondence_ramp() > 0
+            self.training and self.correspondence_loss.enabled and self._correspondence_ramp() > 0
         )
         output = self.model(
             x=xt,
@@ -344,11 +376,18 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             loss = loss + self.detail_loss_weight * detail_loss
             metrics["detail_loss"] = detail_loss
         if attention_maps:
-            correspondence_target, correspondence_weight, similarity = self._correspondence_targets(
-                batch, encoded, masks.token, keep
-            )
+            appearance, appearance_weight = self._appearance_targets(batch, encoded, masks.token, keep)
+            correspondence_target = correspondence_weight = similarity = None
+            if self.correspondence_teacher is not None:
+                correspondence_target, correspondence_weight, similarity = self._correspondence_targets(
+                    batch, encoded, masks.token, keep
+                )
             correspondence_loss, correspondence_metrics = self.correspondence_loss(
-                attention_maps, correspondence_target, correspondence_weight
+                attention_maps,
+                correspondence_target,
+                correspondence_weight,
+                appearance=appearance,
+                appearance_weight=appearance_weight,
             )
             ramp = self._correspondence_ramp()
             loss = loss + ramp * correspondence_loss
@@ -356,13 +395,14 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             metrics["correspondence_loss"] = correspondence_loss.detach()
             metrics["correspondence_ramp"] = torch.as_tensor(ramp, device=loss.device)
             editable = masks.token.float().sum().clamp_min(1)
-            # How much of the editable region the teacher was confident enough to supervise,
-            # and how strong those matches were. If coverage collapses, min_similarity is
-            # too aggressive and the loss is silently doing nothing.
-            metrics["correspondence_coverage"] = (correspondence_weight > 0).float().sum() / editable
-            metrics["correspondence_similarity"] = (
-                similarity * masks.token.float()
-            ).sum() / editable
+            if correspondence_weight is not None:
+                # How much of the editable region the teacher was confident enough to
+                # supervise, and how strong those matches were. If coverage collapses,
+                # min_similarity is too aggressive and the loss is silently doing nothing.
+                metrics["correspondence_coverage"] = (correspondence_weight > 0).float().sum() / editable
+                metrics["correspondence_similarity"] = (
+                    similarity * masks.token.float()
+                ).sum() / editable
         return loss, metrics
 
     @torch.no_grad()

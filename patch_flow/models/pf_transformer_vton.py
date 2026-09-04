@@ -96,6 +96,10 @@ class VTONPatchForcingDiT(PatchForcingDiT):
     ``middle``  VAE encoder 1/4-resolution feature map
     ``detail``  VAE encoder 1/2-resolution feature map, the finest appearance carrier
 
+    Every branch's tokens are LayerNormed before the positional embedding is added
+    (``garment_token_norm``), so key magnitude is set by the model rather than by the SD
+    VAE's internal activation scale.
+
     There is no semantic (DINO) conditioning branch. Its former job -- establishing which
     garment region belongs at which body location -- is now supervised directly on the
     cross-attention maps by :mod:`patch_flow.correspondence`, using a frozen DINOv3
@@ -109,6 +113,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         *args,
         person_condition_channels=5,
         use_vae_garment=True,
+        garment_token_norm=True,
         garment_middle_channels=None,
         garment_detail_channels=None,
         garment_scale_routes=None,
@@ -135,6 +140,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         self.state_channels = self.in_channels
         self.person_condition_channels = person_condition_channels
         self.use_vae_garment = bool(use_vae_garment)
+        self.garment_token_norm = bool(garment_token_norm)
         self.garment_middle_channels = None if garment_middle_channels is None else int(garment_middle_channels)
         self.garment_detail_channels = None if garment_detail_channels is None else int(garment_detail_channels)
         self.garment_embed_gain = float(garment_embed_gain)
@@ -175,6 +181,21 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             for embedder in (self.garment_middle_embedder, self.garment_detail_embedder):
                 nn.init.xavier_uniform_(embedder.weight, gain=self.garment_embed_gain)
                 nn.init.zeros_(embedder.bias)
+
+        # Nothing else normalises the garment key/value path. The queries are LayerNormed
+        # by ``garment_norm`` inside each block, but the keys and values are raw SD-VAE
+        # encoder activations whose scale is set by the VAE's internals -- measured at
+        # 512x384, per-token magnitudes were 25 (coarse), 143 (middle) and 68 (detail)
+        # against LayerNormed queries at ~34, and darker fabric produced systematically
+        # larger keys (navy 1.27-1.41x the garment mean), biasing every query toward it.
+        # Normalising the content before the positional embedding is added also fixes the
+        # content-to-position ratio, which was 0.86 for coarse (i.e. the coarse keys were
+        # more than half positional) against 4.2 for middle.
+        self.garment_token_norms = None
+        if self.garment_token_norm:
+            self.garment_token_norms = nn.ModuleDict(
+                {scale: nn.LayerNorm(self.hidden_size, eps=1e-6) for scale in self._enabled_scales()}
+            )
 
         with torch.no_grad():
             self.x_embedder.proj.weight.zero_()
@@ -314,6 +335,11 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             tokens.shape[0], self.out_channels, grid_height * patch_height, grid_width * patch_width
         )
 
+    def _normalize_garment_tokens(self, scale, tokens):
+        if self.garment_token_norms is None:
+            return tokens
+        return self.garment_token_norms[scale](tokens)
+
     def _garment_branches(self, garment, garment_middle, garment_detail, x, position, height, width):
         tokens = {}
         grids = {}
@@ -322,7 +348,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
 
         if garment is not None and self.garment_embedder is not None:
             latent = F.interpolate(garment, size=(height, width), mode="bilinear", align_corners=False)
-            tokens["coarse"] = self.garment_embedder(latent) + position
+            tokens["coarse"] = self._normalize_garment_tokens("coarse", self.garment_embedder(latent)) + position
             grids["coarse"] = (token_height, token_width)
 
         for name, source, embedder in (
@@ -335,7 +361,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 raise ValueError(f"garment_{name}_channels must be configured to use the '{name}' branch")
             embedded = embedder(source)
             grid = (embedded.shape[-2], embedded.shape[-1])
-            embedded = embedded.flatten(2).transpose(1, 2)
+            embedded = self._normalize_garment_tokens(name, embedded.flatten(2).transpose(1, 2))
             tokens[name] = embedded.to(x.dtype) + self._grid_position_embedding(*grid, x.dtype, x.device)
             grids[name] = grid
         return tokens, grids

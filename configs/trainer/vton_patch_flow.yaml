@@ -35,12 +35,28 @@ params:
   # cosine similarity; that match is the ground-truth position for the garment
   # cross-attention. Training-time only: nothing here is fed to the network, so
   # inference and the exported checkpoint's conditioning path stay pure SD-VAE.
-  # Pull the attention barycentre onto the matched garment position.
-  correspondence_center_weight: 1.0
-  # Sharpen the distribution. Without it, attending uniformly to a symmetric
-  # neighbourhood satisfies the barycentre term exactly as well as attending to the
-  # right token. Small: too large collapses attention before placement is learned.
+  # PRIMARY position term: maximise the attention mass landing within nll_radius of the
+  # matched key, i.e. constrain WHICH keys are attended to. Watch
+  # train/correspondence_target_mass -- measured before this term existed it was 0.05 for
+  # coarse and 0.005 for detail, meaning essentially no mass on the target.
+  correspondence_nll_weight: 1.0
+  # Radius in normalised garment units. 0.05 is about one token diagonal on a 32x24 grid
+  # and is converted per branch, so every branch supervises the same physical area.
+  correspondence_nll_radius: 0.05
+  # Secondary, smooth long-range pull on the barycentre. Demoted from 1.0: on its own it
+  # is satisfied by a sharp BIMODAL map straddling the target, which retrieves a blend of
+  # two fabrics -- navy plus lavender reads as uniform violet.
+  correspondence_center_weight: 0.25
+  # Removes the remaining freedom to answer diffusely. Note it penalises spread, not
+  # displacement, so it cannot substitute for the nll term.
   correspondence_entropy_weight: 0.05
+  # Appearance-space routing, self-supervised from the paired data and needing no
+  # teacher: the mass-weighted garment RGB a person token retrieves must match the RGB
+  # that token has in the ground-truth worn image. DINOv3 geometry alone reaches only
+  # 0.455 RGB error against 0.119 for the best available garment token, so the remaining
+  # colour signal has to be asked for directly. Watch
+  # train/correspondence_appearance_error (0.817 = the garment-mean failure mode).
+  correspondence_photometric_weight: 1.0
   correspondence_teacher_name: facebook/dinov3-vits16-pretrain-lvd1689m
   # null keeps the dataset resolution (rounded to the teacher patch grid), so the
   # letterboxed aspect ratio is preserved and matched positions are not sheared.

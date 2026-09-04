@@ -5,21 +5,38 @@ actually corresponds to, by cosine similarity of patch features. That match is t
 ground truth for *where* the cross-attention should look, and two losses are applied
 directly to the attention distribution:
 
+``target mass`` (negative log-likelihood)
+    the primary term. Maximises the attention mass that lands *within a radius of the
+    matched key*, i.e. it constrains **which** keys are attended to.
+
 ``centre of mass``
-    the attention barycentre over garment positions is pulled onto the matched garment
-    position. This is what turns "attend to the garment" into "attend to *this part* of
-    the garment", which is exactly the placement signal a flow loss on latents gives only
-    indirectly.
+    a secondary, smooth long-range pull on the attention barycentre. On its own it is not
+    enough, and measurably so: a map can be sharp (3.8 effective keys out of 768), have a
+    barycentre 1.7 tokens from the target, and still place its peak 4.5 tokens away with
+    only 5% of its mass near the target. Sharp plus barycentre-correct plus displaced is a
+    bimodal map straddling the target, and what it retrieves is a *blend* of two different
+    fabrics -- which is exactly how a navy-and-lavender garment renders as uniform violet.
+    Entropy does not catch this, because it penalises spread and not displacement.
 
 ``entropy``
-    a diffuse distribution has the same barycentre as a sharp one centred at the same
-    point, so the centre-of-mass term alone is satisfied by attending uniformly to a
-    symmetric neighbourhood. The entropy term removes that degenerate solution.
+    removes the remaining freedom to answer with a diffuse distribution.
+
+``photometric``
+    the mass-weighted garment appearance a person token retrieves must match the
+    appearance that token actually has in the ground-truth worn image. This needs no
+    teacher at all -- it is self-supervised from the paired data -- and it constrains
+    routing in *appearance* space rather than in position space. That matters because
+    DINOv3 correspondence is geometric: measured over 24 VITON-HD test pairs, a delta at
+    the DINOv3 target retrieves the right colour to within 0.455 RGB, against 0.817 for
+    the garment mean and 0.119 for the best available garment token. Geometry recovers
+    about half of the colour signal; the rest has to be asked for directly.
 
 The teacher is **not** a conditioning branch: no DINO feature ever reaches the network.
 It runs under ``no_grad`` on the ground-truth person image, which exists only at training
 time, and disappears entirely at inference.
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -209,70 +226,170 @@ def correspondence_targets(
     return target, weight, best_similarity
 
 
-class CorrespondenceAttentionLoss(nn.Module):
-    """Centre-of-mass and entropy losses on garment cross-attention maps."""
+def neighbourhood_mass(attention, target, grid, radius):
+    """Attention mass landing within ``radius`` (normalised units) of each target.
 
-    def __init__(self, center_weight=1.0, entropy_weight=0.05, entropy_eps=1e-8):
+    Only the window of keys around each target is gathered, never a dense
+    ``(queries, keys)`` distance matrix: the detail branch has 3072 keys, and that matrix
+    would be several times larger than the attention map it is measuring.
+    """
+    grid_height, grid_width = int(grid[0]), int(grid[1])
+    device = attention.device
+    span_y = max(1, int(math.ceil(radius * grid_height)))
+    span_x = max(1, int(math.ceil(radius * grid_width)))
+    offset_y, offset_x = torch.meshgrid(
+        torch.arange(-span_y, span_y + 1, device=device),
+        torch.arange(-span_x, span_x + 1, device=device),
+        indexing="ij",
+    )
+    offset_y = offset_y.reshape(-1)
+    offset_x = offset_x.reshape(-1)
+    centre_y = (target[..., 1] * grid_height - 0.5).round().long()
+    centre_x = (target[..., 0] * grid_width - 0.5).round().long()
+    row = centre_y[..., None] + offset_y
+    column = centre_x[..., None] + offset_x
+    # Out-of-grid offsets are dropped rather than clamped, so no key is counted twice.
+    inside = (row >= 0) & (row < grid_height) & (column >= 0) & (column < grid_width)
+    row_safe = row.clamp(0, grid_height - 1)
+    column_safe = column.clamp(0, grid_width - 1)
+    key_u = (column_safe.to(attention.dtype) + 0.5) / grid_width
+    key_v = (row_safe.to(attention.dtype) + 0.5) / grid_height
+    near = (key_u - target[..., 0:1]).square() + (key_v - target[..., 1:2]).square() <= radius ** 2
+    index = row_safe * grid_width + column_safe
+    return (attention.gather(-1, index) * (inside & near).to(attention.dtype)).sum(-1)
+
+
+class CorrespondenceAttentionLoss(nn.Module):
+    """Target-mass, centre-of-mass, entropy and photometric losses on garment attention."""
+
+    def __init__(
+        self,
+        center_weight=0.25,
+        entropy_weight=0.05,
+        nll_weight=1.0,
+        nll_radius=0.05,
+        photometric_weight=1.0,
+        entropy_eps=1e-8,
+    ):
         super().__init__()
         self.center_weight = float(center_weight)
         self.entropy_weight = float(entropy_weight)
+        self.nll_weight = float(nll_weight)
+        self.nll_radius = float(nll_radius)
+        self.photometric_weight = float(photometric_weight)
         self.entropy_eps = float(entropy_eps)
+        if not 0 < self.nll_radius < 1:
+            raise ValueError("nll_radius is in normalised garment units and must be in (0, 1)")
+
+    @property
+    def needs_target(self):
+        """Whether a correspondence teacher is required at all."""
+        return self.center_weight > 0 or self.nll_weight > 0
 
     @property
     def enabled(self):
-        return self.center_weight > 0 or self.entropy_weight > 0
+        return (
+            self.needs_target
+            or self.entropy_weight > 0
+            or self.photometric_weight > 0
+        )
 
-    def forward(self, attention_maps, target, weight):
-        """``attention_maps`` is the list returned by ``VTONPatchForcingDiT``."""
-        device = target.device
+    def forward(self, attention_maps, target=None, weight=None, appearance=None, appearance_weight=None):
+        """``attention_maps`` is the list returned by ``VTONPatchForcingDiT``.
+
+        ``target``/``weight`` drive the teacher-based terms; ``appearance`` carries
+        ``query`` (B, queries, C) ground-truth worn appearance and ``garment`` (B, C, H, W)
+        for the photometric term, which needs no teacher.
+        """
+        reference = next((entry["weights"] for entry in attention_maps), None)
+        if reference is None:
+            device = target.device if target is not None else "cpu"
+            return torch.zeros((), device=device, dtype=torch.float32), {}
+        device = reference.device
         zero = torch.zeros((), device=device, dtype=torch.float32)
-        if not attention_maps:
-            return zero, {}
 
-        weight = weight.float()
-        denominator = weight.sum().clamp_min(1e-6)
-        center_total = zero
-        entropy_total = zero
+        use_target = target is not None and weight is not None and self.needs_target
+        weight = None if weight is None else weight.float()
+        appearance_weight = None if appearance_weight is None else appearance_weight.float()
+        spread_weight = weight if weight is not None else appearance_weight
+        use_photometric = (
+            appearance is not None and appearance_weight is not None and self.photometric_weight > 0
+        )
+
+        totals = {"center": zero, "entropy": zero, "nll": zero, "photometric": zero, "mass": zero}
         metrics = {}
         for entry in attention_maps:
             attention = entry["weights"].float()
-            if attention.shape[1] != target.shape[1]:
-                raise ValueError(
-                    f"Attention has {attention.shape[1]} queries but the correspondence target has "
-                    f"{target.shape[1]}; the query grid must be the person token grid"
-                )
-            coordinates = grid_coordinates(entry["grid"], device=device, dtype=attention.dtype)
+            grid = entry["grid"]
+            prefix = f"correspondence/block_{entry['block']:02d}_{entry['scale']}"
+            coordinates = grid_coordinates(grid, device=device, dtype=attention.dtype)
             if coordinates.shape[0] != attention.shape[-1]:
                 raise ValueError(
-                    f"Branch '{entry['scale']}' has {attention.shape[-1]} keys but grid {entry['grid']}"
+                    f"Branch '{entry['scale']}' has {attention.shape[-1]} keys but grid {grid}"
                 )
-            center = attention @ coordinates
-            distance = (center - target).square().sum(-1)
-            center_loss = (distance * weight).sum() / denominator
 
-            logs = torch.log(attention.clamp_min(self.entropy_eps))
-            entropy = -(attention * logs).sum(-1)
-            padding = entry.get("key_padding")
-            keys = (
-                torch.full((attention.shape[0], 1), float(attention.shape[-1]), device=device)
-                if padding is None
-                else (~padding).sum(-1, keepdim=True).float()
-            )
-            # Normalise by the entropy of the uniform distribution over usable keys so the
-            # 3072-key detail branch and the 768-key coarse branch contribute comparably.
-            entropy = entropy / torch.log(keys.clamp_min(2.0))
-            entropy_loss = (entropy * weight).sum() / denominator
+            if use_target:
+                if attention.shape[1] != target.shape[1]:
+                    raise ValueError(
+                        f"Attention has {attention.shape[1]} queries but the correspondence target has "
+                        f"{target.shape[1]}; the query grid must be the person token grid"
+                    )
+                denominator = weight.sum().clamp_min(1e-6)
+                center = attention @ coordinates
+                center_loss = ((center - target).square().sum(-1) * weight).sum() / denominator
+                mass = neighbourhood_mass(attention, target, grid, self.nll_radius)
+                nll_loss = (-torch.log(mass.clamp_min(1e-6)) * weight).sum() / denominator
+                totals["center"] = totals["center"] + center_loss
+                totals["nll"] = totals["nll"] + nll_loss
+                totals["mass"] = totals["mass"] + (mass * weight).sum() / denominator
+                metrics[f"{prefix}/center"] = center_loss.detach()
+                metrics[f"{prefix}/nll"] = nll_loss.detach()
+                metrics[f"{prefix}/target_mass"] = ((mass * weight).sum() / denominator).detach()
 
-            center_total = center_total + center_loss
-            entropy_total = entropy_total + entropy_loss
-            prefix = f"correspondence/block_{entry['block']:02d}_{entry['scale']}"
-            metrics[f"{prefix}/center"] = center_loss.detach()
-            metrics[f"{prefix}/entropy"] = entropy_loss.detach()
+            if self.entropy_weight > 0 and spread_weight is not None:
+                spread_denominator = spread_weight.sum().clamp_min(1e-6)
+                entropy = -(attention * torch.log(attention.clamp_min(self.entropy_eps))).sum(-1)
+                padding = entry.get("key_padding")
+                keys = (
+                    torch.full((attention.shape[0], 1), float(attention.shape[-1]), device=device)
+                    if padding is None
+                    else (~padding).sum(-1, keepdim=True).float()
+                )
+                # Normalise by the entropy of the uniform distribution over usable keys so the
+                # 3072-key detail branch and the 768-key coarse branch contribute comparably.
+                entropy = entropy / torch.log(keys.clamp_min(2.0))
+                entropy_loss = (entropy * spread_weight).sum() / spread_denominator
+                totals["entropy"] = totals["entropy"] + entropy_loss
+                metrics[f"{prefix}/entropy"] = entropy_loss.detach()
+
+            if use_photometric:
+                photometric_denominator = appearance_weight.sum().clamp_min(1e-6)
+                keys_appearance = (
+                    F.adaptive_avg_pool2d(appearance["garment"].float(), (int(grid[0]), int(grid[1])))
+                    .flatten(2)
+                    .transpose(1, 2)
+                )
+                retrieved = attention @ keys_appearance
+                error = (retrieved - appearance["query"].float()).square().sum(-1)
+                photometric_loss = (error * appearance_weight).sum() / photometric_denominator
+                totals["photometric"] = totals["photometric"] + photometric_loss
+                metrics[f"{prefix}/photometric"] = photometric_loss.detach()
 
         count = len(attention_maps)
-        center_total = center_total / count
-        entropy_total = entropy_total / count
-        loss = self.center_weight * center_total + self.entropy_weight * entropy_total
-        metrics["correspondence_center_loss"] = center_total.detach()
-        metrics["correspondence_entropy"] = entropy_total.detach()
+        for key in totals:
+            totals[key] = totals[key] / count
+        loss = (
+            self.nll_weight * totals["nll"]
+            + self.center_weight * totals["center"]
+            + self.entropy_weight * totals["entropy"]
+            + self.photometric_weight * totals["photometric"]
+        )
+        metrics["correspondence_nll"] = totals["nll"].detach()
+        metrics["correspondence_center_loss"] = totals["center"].detach()
+        metrics["correspondence_entropy"] = totals["entropy"].detach()
+        metrics["correspondence_photometric"] = totals["photometric"].detach()
+        # Directly interpretable: mass actually landing on the target, and the retrieved
+        # appearance error in the same RGB units the diagnostics report.
+        metrics["correspondence_target_mass"] = totals["mass"].detach()
+        metrics["correspondence_appearance_error"] = totals["photometric"].detach().clamp_min(0).sqrt()
         return loss, metrics

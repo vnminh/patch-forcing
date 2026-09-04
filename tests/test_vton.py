@@ -12,6 +12,7 @@ from patch_flow.correspondence import (
     correspondence_targets,
     grid_coordinates,
     mask_to_token_valid,
+    neighbourhood_mass,
 )
 from patch_flow.flow_vton import VTONPatchFlowForcing
 from patch_flow.models.pf_transformer import PatchForcingDiT
@@ -150,7 +151,9 @@ class VTONTests(unittest.TestCase):
         attention[0, 1, 9] = 1
         attention[0, 2, 2] = 1
         target = coordinates[[5, 9, 2]][None]
-        loss_fn = CorrespondenceAttentionLoss(center_weight=1.0, entropy_weight=0.0)
+        loss_fn = CorrespondenceAttentionLoss(
+            center_weight=1.0, entropy_weight=0.0, nll_weight=0.0, photometric_weight=0.0
+        )
         loss, metrics = loss_fn(
             [{"block": 1, "scale": "coarse", "weights": attention, "grid": grid, "key_padding": None}],
             target,
@@ -167,8 +170,12 @@ class VTONTests(unittest.TestCase):
         sharp = torch.tensor([[[0.0, 0.5, 0.5, 0.0]]])
         diffuse = torch.tensor([[[0.25, 0.25, 0.25, 0.25]]])
         target = ((coordinates[1] + coordinates[2]) / 2)[None, None]
-        center_only = CorrespondenceAttentionLoss(center_weight=1.0, entropy_weight=0.0)
-        with_entropy = CorrespondenceAttentionLoss(center_weight=1.0, entropy_weight=1.0)
+        center_only = CorrespondenceAttentionLoss(
+            center_weight=1.0, entropy_weight=0.0, nll_weight=0.0, photometric_weight=0.0
+        )
+        with_entropy = CorrespondenceAttentionLoss(
+            center_weight=1.0, entropy_weight=1.0, nll_weight=0.0, photometric_weight=0.0
+        )
         weight = torch.ones(1, 1)
 
         def evaluate(loss_fn, attention):
@@ -184,7 +191,9 @@ class VTONTests(unittest.TestCase):
         grid = (1, 4)
         attention = torch.tensor([[[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]])
         target = grid_coordinates(grid)[[0, 0]][None]
-        loss_fn = CorrespondenceAttentionLoss(center_weight=1.0, entropy_weight=0.0)
+        loss_fn = CorrespondenceAttentionLoss(
+            center_weight=1.0, entropy_weight=0.0, nll_weight=0.0, photometric_weight=0.0
+        )
         maps = [{"block": 1, "scale": "coarse", "weights": attention, "grid": grid, "key_padding": None}]
         # Token 1 is badly placed, but a zero weight (dropped garment, or a match below the
         # confidence gate) must remove it from both numerator and denominator.
@@ -237,11 +246,207 @@ class VTONTests(unittest.TestCase):
         trainer.correspondence_warmup_steps = 0
         self.assertEqual(trainer._correspondence_ramp(), 1.0)
 
+    @staticmethod
+    def _map(attention, grid, padding=None, scale="coarse", block=1):
+        return [{"block": block, "scale": scale, "weights": attention,
+                 "grid": grid, "key_padding": padding}]
+
+    def test_neighbourhood_mass_matches_a_dense_distance_computation(self):
+        grid = (6, 5)
+        torch.manual_seed(0)
+        attention = torch.rand(2, 4, 30)
+        attention = attention / attention.sum(-1, keepdim=True)
+        target = torch.rand(2, 4, 2)
+        coordinates = grid_coordinates(grid)
+        for radius in (0.05, 0.15, 0.4):
+            with self.subTest(radius=radius):
+                dense = (coordinates[None, None] - target[:, :, None]).norm(dim=-1) <= radius
+                torch.testing.assert_close(
+                    neighbourhood_mass(attention, target, grid, radius),
+                    (attention * dense).sum(-1), rtol=1e-5, atol=1e-6,
+                )
+
+    def test_neighbourhood_mass_never_double_counts_at_the_border(self):
+        """Out-of-grid offsets must be dropped, not clamped onto an in-grid key."""
+        grid = (4, 4)
+        attention = torch.zeros(1, 1, 16)
+        attention[0, 0, 0] = 1.0
+        target = grid_coordinates(grid)[0].view(1, 1, 2)
+        self.assertAlmostEqual(float(neighbourhood_mass(attention, target, grid, 0.05)), 1.0, places=6)
+
+    def test_nll_separates_on_target_from_bimodal_straddling(self):
+        """The measured failure mode.
+
+        On the real 32x24 run the coarse blocks reached a barycentre 1.7 tokens from the
+        target with only 3.8 effective keys -- and put their argmax 4.5 tokens away, with
+        5% of mass near the target. Barycentre and entropy both rate that as good; only a
+        term on the target mass can reject it.
+        """
+        grid = (1, 9)
+        coordinates = grid_coordinates(grid)
+        target = coordinates[4].view(1, 1, 2)
+        on_target = torch.zeros(1, 1, 9); on_target[0, 0, 4] = 1.0
+        straddling = torch.zeros(1, 1, 9)                # identical barycentre, no mass on it
+        straddling[0, 0, 1] = 0.5
+        straddling[0, 0, 7] = 0.5
+        w = torch.ones(1, 1)
+        only = lambda **kw: CorrespondenceAttentionLoss(
+            **{"center_weight": 0.0, "entropy_weight": 0.0, "nll_weight": 0.0,
+               "photometric_weight": 0.0, **kw})
+
+        gap = lambda fn: abs(fn(self._map(straddling, grid), target, w)[0].item()
+                             - fn(self._map(on_target, grid), target, w)[0].item())
+
+        # Barycentre: completely blind, by construction.
+        self.assertAlmostEqual(gap(only(center_weight=1.0)), 0.0, places=6)
+        # Entropy: both maps are sharp, so at the shipped weight it barely reacts.
+        entropy_gap = gap(only(entropy_weight=0.05))
+        # Target mass: rejects the straddling map outright.
+        nll_gap = gap(only(nll_weight=1.0, nll_radius=0.05))
+        self.assertAlmostEqual(
+            only(nll_weight=1.0, nll_radius=0.05)(self._map(on_target, grid), target, w)[0].item(),
+            0.0, places=4)
+        self.assertGreater(nll_gap, 5.0)
+        self.assertGreater(nll_gap, 50 * entropy_gap)
+
+    def test_target_mass_metric_reports_the_measured_quantity(self):
+        grid = (1, 9)
+        target = grid_coordinates(grid)[4].view(1, 1, 2)
+        attention = torch.zeros(1, 1, 9)
+        attention[0, 0, 4] = 0.3
+        attention[0, 0, 0] = 0.7
+        loss_fn = CorrespondenceAttentionLoss(nll_radius=0.05, photometric_weight=0.0)
+        _, metrics = loss_fn(self._map(attention, grid), target, torch.ones(1, 1))
+        self.assertAlmostEqual(metrics["correspondence_target_mass"].item(), 0.3, places=5)
+
+    def test_photometric_loss_penalises_retrieving_the_garment_mean(self):
+        """Exactly the observed defect: every person token retrieving the same average
+        colour rather than the colour it needs."""
+        garment = torch.zeros(1, 3, 1, 2)
+        garment[0, :, 0, 0] = torch.tensor([-0.60, -0.71, -0.55])      # navy
+        garment[0, :, 0, 1] = torch.tensor([0.51, 0.40, 0.65])         # lavender
+        query = torch.stack([garment[0, :, 0, 0], garment[0, :, 0, 1]])[None]
+        appearance = {"garment": garment, "query": query}
+        grid = (1, 2)
+        loss_fn = CorrespondenceAttentionLoss(
+            center_weight=0.0, entropy_weight=0.0, nll_weight=0.0, photometric_weight=1.0)
+        w = torch.ones(1, 2)
+        got = {}
+        for name, a in (("correct", torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])),
+                        ("mean", torch.tensor([[[0.5, 0.5], [0.5, 0.5]]])),
+                        ("swapped", torch.tensor([[[0.0, 1.0], [1.0, 0.0]]]))):
+            loss, metrics = loss_fn(self._map(a, grid), appearance=appearance, appearance_weight=w)
+            got[name] = (loss.item(), metrics["correspondence_appearance_error"].item())
+        self.assertAlmostEqual(got["correct"][0], 0.0, places=6)
+        self.assertGreater(got["mean"][0], 0.4)
+        self.assertGreater(got["swapped"][0], got["mean"][0])
+        # Reported in RGB L2 units so it reads against the measured 0.817 mean-colour
+        # baseline and the 0.119 oracle straight off tensorboard.
+        self.assertAlmostEqual(got["mean"][1], got["mean"][0] ** 0.5, places=5)
+
+    def test_photometric_term_needs_no_teacher(self):
+        loss_fn = CorrespondenceAttentionLoss(
+            center_weight=0.0, nll_weight=0.0, entropy_weight=0.0, photometric_weight=1.0)
+        self.assertFalse(loss_fn.needs_target)
+        self.assertTrue(loss_fn.enabled)
+        grid = (1, 2)
+        garment = torch.zeros(1, 3, 1, 2); garment[0, :, 0, 1] = 1.0
+        appearance = {"garment": garment, "query": torch.ones(1, 1, 3)}
+        loss, metrics = loss_fn(self._map(torch.tensor([[[0.5, 0.5]]]), grid), None, None,
+                                appearance=appearance, appearance_weight=torch.ones(1, 1))
+        self.assertGreater(loss.item(), 0)
+        self.assertNotIn("correspondence/block_01_coarse/nll", metrics)
+
+    def test_dropped_samples_are_excluded_from_every_term(self):
+        grid = (1, 4)
+        target = grid_coordinates(grid)[0].expand(1, 2, 2).contiguous()
+        attention = torch.tensor([[[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]])
+        appearance = {"garment": torch.randn(1, 3, 1, 4), "query": torch.randn(1, 2, 3)}
+        loss_fn = CorrespondenceAttentionLoss(nll_radius=0.05)
+        gate = torch.tensor([[1.0, 0.0]])
+        gated = loss_fn(self._map(attention, grid), target, gate,
+                        appearance=appearance, appearance_weight=gate)[0]
+        every = loss_fn(self._map(attention, grid), target, torch.ones(1, 2),
+                        appearance=appearance, appearance_weight=torch.ones(1, 2))[0]
+        self.assertLess(gated.item(), every.item())
+
+    def test_shipped_init_std_lands_in_the_working_band(self):
+        """Guards the fix for the deadlock, at the value the config actually ships.
+
+        At std 1e-3 the garment output projection started at Frobenius norm 1.15 on a
+        1152x1152 matrix -- 29x below standard init -- and measured on a real run it did
+        not grow: 0.7 per 1000 steps where a coherent Adam trajectory moves ~0.1 per step.
+        The branch stayed a ~2% contributor to the residual stream, so the retrieved
+        garment could tint the shirt but never restructure it. The garment residual is
+        ungated (x = x + cross) while self-attention is gated by adaLN, so parity with the
+        pretrained projections is stronger than it looks; 0.2-0.5 of standard init is the
+        intended range.
+        """
+        from omegaconf import OmegaConf
+
+        hidden = 1152
+        standard = (2 / (hidden + hidden)) ** 0.5 * hidden          # xavier, ~33.9
+        shipped = float(
+            OmegaConf.load(Path(__file__).resolve().parents[1] / "configs/model/vton-pft-xl.yaml")
+            .params.garment_attention_output_init_std
+        )
+        torch.manual_seed(0)
+        model = VTONPatchForcingDiT(
+            input_size=32, patch_size=2, in_channels=4, hidden_size=hidden, depth=2,
+            num_heads=16, num_classes=1000, predict_uncertainty=True,
+            garment_middle_channels=256, garment_detail_channels=128,
+            garment_scale_routes=["coarse", "detail"], cross_attention_every=1,
+            garment_attention_output_init_std=shipped, compile=False,
+        )
+        for block in model.blocks:
+            ratio = float(block.garment_cross_attention.out_proj.weight.detach().norm()) / standard
+            self.assertGreater(ratio, 0.2, f"init std {shipped} re-enters the muted-branch deadlock")
+            self.assertLess(ratio, 0.6, f"init std {shipped} would overpower the ungated residual")
+        # The value it replaced is far outside that band -- this is what changed.
+        self.assertLess(1e-3 * hidden / standard, 0.05)
+
+    def test_garment_token_norm_equalises_key_scale_across_branches(self):
+        """Raw VAE activations differ in scale by branch (measured 25 / 143 / 68 per
+        token at 512x384). The norm must remove that."""
+        for enabled in (False, True):
+            model = self._multiscale_model(garment_token_norm=enabled).eval()
+            position = model._position_embedding(8, 6, torch.float32, "cpu")
+            with torch.no_grad():
+                tokens, _ = model._garment_branches(
+                    torch.randn(1, 4, 8, 6),
+                    torch.randn(1, 16, 16, 12) * 30.0,
+                    torch.randn(1, 8, 32, 24) * 3.0,
+                    torch.zeros(1, 12, 64), position, 8, 6,
+                )
+            norms = {k: float(v[0].norm(dim=-1).mean()) for k, v in tokens.items()}
+            spread = max(norms.values()) / min(norms.values())
+            with self.subTest(garment_token_norm=enabled):
+                if enabled:
+                    self.assertLess(spread, 1.5, f"branch key scales still diverge: {norms}")
+                else:
+                    self.assertGreater(spread, 3.0, f"expected raw scale divergence: {norms}")
+
+    def test_garment_token_norm_is_applied_before_the_positional_embedding(self):
+        model = self._multiscale_model(garment_token_norm=True).eval()
+        self.assertEqual(set(model.garment_token_norms), {"coarse", "middle", "detail"})
+        position = model._position_embedding(8, 6, torch.float32, "cpu")
+        with torch.no_grad():
+            tokens, _ = model._garment_branches(
+                torch.randn(1, 4, 8, 6) * 100.0, torch.randn(1, 16, 16, 12),
+                torch.randn(1, 8, 32, 24), torch.zeros(1, 12, 64), position, 8, 6,
+            )
+        # Removing the position must leave a unit-variance LayerNorm output behind.
+        content = tokens["coarse"] - position
+        self.assertAlmostEqual(float(content.var(-1, unbiased=False).mean()), 1.0, places=3)
+        self.assertAlmostEqual(float(content.mean()), 0.0, places=4)
+
     def test_entropy_is_normalised_by_the_usable_key_count(self):
         """Branches with different key counts must contribute comparably, so a uniform
         distribution scores 1.0 whether it spans 4 keys or 2."""
         grid = (1, 4)
-        loss_fn = CorrespondenceAttentionLoss(center_weight=0.0, entropy_weight=1.0)
+        loss_fn = CorrespondenceAttentionLoss(
+            center_weight=0.0, entropy_weight=1.0, nll_weight=0.0, photometric_weight=0.0
+        )
         target = grid_coordinates(grid)[[0]][None]
         padding = torch.tensor([[False, False, True, True]])
         uniform_four = torch.tensor([[[0.25, 0.25, 0.25, 0.25]]])
@@ -577,6 +782,57 @@ class VTONTests(unittest.TestCase):
         # configuration keeps correspondence supervision affordable.
         self.assertEqual([entry["scale"] for entry in restricted], ["coarse", "middle"])
 
+    def test_checkpointed_blocks_return_identical_attention_gradients(self):
+        """The 512x384 config sets gradient_checkpointing AND correspondence_scales, so the
+        attention map is an extra output of a checkpointed block. Verify the recompute in
+        backward reproduces it exactly, and that unsupervised scales stay gradient-free."""
+        def run(gradient_checkpointing):
+            torch.manual_seed(0)
+            model = self._multiscale_model(gradient_checkpointing=gradient_checkpointing).train()
+            torch.manual_seed(1)
+            mask = torch.ones(1, 1, 8, 6)
+            latent = torch.randn(1, 4, 8, 6)
+            _, _, maps = model(
+                latent,
+                torch.full((1, 12), 0.5),
+                torch.zeros(1, dtype=torch.long),
+                person_agnostic=torch.randn_like(latent),
+                person_mask=mask,
+                edit_mask=mask,
+                garment=torch.randn(1, 4, 8, 6),
+                garment_middle=torch.randn(1, 16, 16, 12),
+                garment_detail=torch.randn(1, 8, 32, 24),
+                garment_mask=mask,
+                return_uncertainty=True,
+                return_garment_attention=True,
+                garment_attention_scales=["coarse", "middle"],
+            )
+            self.assertEqual([entry["scale"] for entry in maps], ["coarse", "middle"])
+            target = grid_coordinates((4, 3))[-1].expand(1, 12, 2).contiguous()
+            loss, _ = CorrespondenceAttentionLoss(
+                center_weight=1.0, entropy_weight=0.05, nll_weight=0.0, photometric_weight=0.0
+            )(maps, target, torch.ones(1, 12))
+            loss.backward()
+            grads = [
+                block.garment_cross_attention.in_proj_weight.grad for block in model.blocks
+            ]
+            return loss.detach(), grads
+
+        plain_loss, plain_grads = run(False)
+        checkpointed_loss, checkpointed_grads = run(True)
+        torch.testing.assert_close(checkpointed_loss, plain_loss, rtol=0, atol=0)
+        for scale, plain, checkpointed in zip(
+            ("coarse", "middle", "detail"), plain_grads, checkpointed_grads
+        ):
+            if scale == "detail":
+                # Not in correspondence_scales, so this loss must never reach it.
+                self.assertIsNone(plain, "detail block received correspondence gradient")
+                self.assertIsNone(checkpointed, "detail block received correspondence gradient")
+                continue
+            self.assertIsNotNone(plain)
+            self.assertGreater(plain.abs().sum().item(), 0)
+            torch.testing.assert_close(checkpointed, plain, rtol=0, atol=0)
+
     def test_correspondence_loss_moves_attention_towards_the_matched_token(self):
         """End to end: the loss reaches the cross-attention parameters and sharpens the
         map onto the requested garment cell."""
@@ -596,7 +852,9 @@ class VTONTests(unittest.TestCase):
         matched = grid[0] * grid[1] - 1
         # Ask every person token to attend to the bottom-right garment token.
         target = grid_coordinates(grid)[matched].expand(1, 12, 2).contiguous()
-        loss_fn = CorrespondenceAttentionLoss(center_weight=1.0, entropy_weight=0.05)
+        loss_fn = CorrespondenceAttentionLoss(
+            center_weight=1.0, entropy_weight=0.05, nll_weight=0.0, photometric_weight=0.0
+        )
         optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-2)
 
         def step():

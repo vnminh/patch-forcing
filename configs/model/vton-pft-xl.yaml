@@ -12,11 +12,21 @@ params:
   # they are the only garment conditioning. Correspondence is no longer a fourth key set;
   # it is supervised directly on these branches' attention maps (see trainer config).
   use_vae_garment: true
+  # LayerNorm every branch's tokens before the positional embedding is added. Without it
+  # the keys and values are raw SD-VAE activations: measured per-token magnitudes were 25
+  # (coarse) / 143 (middle) / 68 (detail) against LayerNormed queries at ~34, darker
+  # fabric produced systematically larger keys, and coarse keys were more than half
+  # positional. Set false only to reproduce the pre-fix behaviour.
+  garment_token_norm: true
   garment_middle_channels: null
   garment_detail_channels: null
   garment_scale_routes: null
   garment_embed_gain: 1.0
-  # Small residual initialization wakes Q/K/V and garment feature projections on step 1.
-  garment_attention_output_init_std: 1.0e-3
+  # Standard init for a 1152x1152 matrix is ~0.0295. 1e-3 was 29x below that and did not
+  # grow: measured on a real run the projection norm crawled 0.7 per 1000 steps where a
+  # coherent Adam trajectory moves ~0.1 per step, leaving the garment branch a ~2%
+  # contributor to the residual stream. The garment residual is ungated, so ~0.45 of
+  # standard init is the working range.
+  garment_attention_output_init_std: 1.3e-2
   cross_attention_every: 4
   pretrained_ckpt: ${oc.env:PFT_XL_CKPT,null}

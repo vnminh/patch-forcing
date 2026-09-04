@@ -443,11 +443,22 @@ initialization; it only flattens the attention.
 tokens are valid keys and values, and it is recomputed per branch at that branch's own
 grid, so the finer `detail` grid gets a correspondingly finer foreground mask.
 
+Each branch's tokens are LayerNormed before the positional embedding is added
+(`garment_token_norm`). Nothing else on the key/value path normalises anything — the
+queries get `garment_norm` inside each block, but keys and values were raw SD-VAE encoder
+activations whose scale is decided by the VAE's internals. Measured at 512-by-384 that gave
+per-token magnitudes of 25 (`coarse`), 143 (`middle`) and 68 (`detail`) against LayerNormed
+queries at ~34; darker fabric produced systematically larger keys (navy 1.27–1.41x the
+garment mean, biasing every query toward it); and the `coarse` keys were more than half
+positional (content-to-position magnitude ratio 0.86, against 4.2 for `middle`).
+Normalising the content *before* adding position fixes both the cross-branch scale spread
+and that ratio.
+
 Every branch receives the DiT grid positional embedding at full strength, interpolated to
 that branch's own grid. This is what makes key index and spatial position interchangeable,
 which the correspondence loss below depends on.
 
-### 10.4 Correspondence supervision (CORAL-style)
+### 10.4 Correspondence and routing supervision (CORAL-style)
 
 The flow loss supervises *pixels*, so it constrains placement only through a long and
 noisy credit-assignment path: put the logo in the wrong place, get a slightly worse
@@ -471,8 +482,20 @@ inside \(M_g\) are candidates, and a match survives only if its similarity clear
 consistency (the chosen garment token must choose that person token back): higher
 precision, lower coverage.
 
-**Centre-of-mass loss.** For a supervised block with attention \(A_{ij}\) over key
-positions \(c_j\),
+**Target-mass loss (primary).** The barycentre and entropy terms below were measured to
+be jointly insufficient, so the primary term constrains *which* keys are attended to:
+
+\[
+\mathcal L_{nll}=-\frac{\sum_i w_i \log \sum_{j:\lVert c_j-c_{j^*(i)}\rVert\le r} A_{ij}}{\sum_i w_i},
+\]
+
+with \(r=\)`correspondence_nll_radius` in normalised garment units, converted to an
+integer key window per branch so every branch supervises the same physical area. Only that
+window is gathered — a dense \((N_q,N_k)\) distance matrix would be several times larger
+than the 768-by-3072 detail attention map it measures.
+
+**Centre-of-mass loss (secondary).** For a supervised block with attention \(A_{ij}\) over
+key positions \(c_j\),
 
 \[
 \mathcal L_{com}=\frac{\sum_i w_i \left\lVert \sum_j A_{ij} c_j - c_{j^*(i)} \right\rVert^2}{\sum_i w_i}.
@@ -482,10 +505,18 @@ Because positions are normalised to \([0,1]^2\), one target serves every branch 
 of its key-grid resolution: the 3072-key `detail` grid and the 768-key `coarse` grid are
 scored in the same coordinate system.
 
-**Entropy loss.** The barycentre is not identifiable on its own — a symmetric blur has
-the same centre of mass as a spike at that centre, so uniform attention over a
-neighbourhood satisfies \(\mathcal L_{com}\) exactly as well as attending to the right
-token. The entropy term removes that degenerate solution:
+It is weighted `0.25`, down from `1.0`. It provides a smooth long-range pull, but it is
+not identifiable: measured on a real 32-by-24 run the coarse blocks reached a barycentre
+1.7 tokens from the target with only 3.8 effective keys — and put their argmax 4.5 tokens
+away, with 5% of their mass near the target. Sharp, barycentre-correct and *displaced* is a
+bimodal map straddling the target, and what it retrieves is a blend of two fabrics. Navy
+sleeves blended with a lavender body is the uniform violet that motivated section 10.5.
+
+**Entropy loss.** A symmetric blur has the same centre of mass as a spike at that centre,
+so uniform attention over a neighbourhood satisfies \(\mathcal L_{com}\) exactly as well as
+attending to the right token. The entropy term removes that particular degenerate
+solution — but note it penalises *spread*, not *displacement*, so it does not catch the
+straddling failure above:
 
 \[
 \mathcal L_{ent}=\frac{\sum_i w_i H(A_i)/\log N_i}{\sum_i w_i},
@@ -500,11 +531,42 @@ it points anywhere useful just locks in a wrong match.
 the ground-truth person image, which exists only during training, and no DINO feature ever
 enters the network. The one training cost is real: `need_weights=True` disables fused
 attention and materialises a \((B, N_q, N_k)\) map per supervised block. At 512-by-384 the
-`detail` branch's map is four times larger than the others, so that configuration sets
-`correspondence_scales: [coarse, middle]` — placement is a coarse-scale property, and the
-detail blocks inherit a settled layout from the residual stream.
+`detail` branch's map is four times larger than the others. The 512-by-384 configuration
+nevertheless supervises it, `correspondence_scales: [coarse, detail]`, and drops `middle`
+instead. Leaving `detail` unsupervised was measured to be the single largest contributor to
+the mean-colour failure: it is routed to 6 of 14 blocks, accounts for the largest share of
+garment influence (15.6% of the predicted velocity against 11.4% for `middle` and 5.1% for
+`coarse`), and its attention spread over 500–1060 of 3072 keys with 0.4–0.7% of mass on the
+target — a near-uniform average of the garment. `middle` is the cheaper thing to drop: its
+keys were the least region-separable of the three (0.067 in value space, against 0.145 for
+`coarse` and 0.219 for `detail`).
 
-**Diagnostics.** `train/correspondence_coverage` is the fraction of editable tokens the
+**Photometric routing loss.** The terms above are all in *position* space and depend on
+the teacher. This one is in *appearance* space and depends on nothing but the paired data:
+the mass-weighted garment colour a person token retrieves must match the colour that token
+has in the ground-truth worn image,
+
+\[
+\mathcal L_{photo}=\frac{\sum_i a_i \left\lVert \sum_j A_{ij}\,g_j - p_i \right\rVert^2}{\sum_i a_i},
+\]
+
+with \(g_j\) the branch-grid mean RGB of garment key \(j\), \(p_i\) the token-grid mean RGB
+of \(I^*\), and \(a_i\) covering every editable token — no confidence gate, because there
+is no teacher to be unconfident. It is needed because DINOv3 correspondence is geometric,
+not photometric: over 24 VITON-HD test pairs a delta at the DINOv3 target retrieves the
+right colour to within 0.455 RGB, against 0.817 for the garment mean and 0.119 for the best
+available garment token. Geometry recovers roughly half the colour signal; the rest has to
+be asked for directly.
+
+Because it needs no teacher, setting `correspondence_center_weight` and
+`correspondence_nll_weight` to 0 leaves a fully functional routing loss and never
+constructs the DINOv3 model at all.
+
+**Diagnostics.** `train/correspondence_appearance_error` is \(\sqrt{\mathcal L_{photo}}\), in
+the same RGB units as the numbers above: 0.817 is the mean-colour failure mode and 0.119 is
+the oracle. `train/correspondence_target_mass` is the attention mass actually landing on
+the target — measured at 0.05 for coarse and 0.005 for detail before the nll term existed.
+`train/correspondence_coverage` is the fraction of editable tokens the
 teacher was confident enough to supervise, and `train/correspondence_similarity` the mean
 best cosine similarity. If coverage collapses toward zero, `correspondence_min_similarity`
 is too aggressive and the loss is silently doing nothing. Per-block
