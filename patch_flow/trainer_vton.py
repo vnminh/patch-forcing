@@ -437,6 +437,11 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 if self.correspondence_loss.value_weight > 0
                 else None
             )
+            if value_targets is not None:
+                # The projected targets are all the loss needs; release the much larger
+                # raw 1/2- and 1/4-resolution target pyramids before CORAL backward.
+                encoded["target_middle"] = None
+                encoded["target_detail"] = None
             correspondence_target = correspondence_weight = similarity = None
             if self.correspondence_teacher is not None:
                 correspondence_target, correspondence_weight, similarity = self._correspondence_targets(
