@@ -40,8 +40,8 @@ params:
   # train/correspondence_target_mass -- measured before this term existed it was 0.05 for
   # coarse and 0.005 for detail, meaning essentially no mass on the target.
   correspondence_nll_weight: 1.0
-  # Radius in normalised garment units. 0.05 is about one token diagonal on a 32x24 grid
-  # and is converted per branch, so every branch supervises the same physical area.
+  # Radius in normalised garment units. It may be a scalar shared by every branch or a
+  # mapping keyed by garment scale. The 512x384 experiment overrides it per scale.
   correspondence_nll_radius: 0.05
   # Secondary, smooth long-range pull on the barycentre. Demoted from 1.0: on its own it
   # is satisfied by a sharp BIMODAL map straddling the target, which retrieves a blend of

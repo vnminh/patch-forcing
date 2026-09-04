@@ -319,6 +319,44 @@ class VTONTests(unittest.TestCase):
         _, metrics = loss_fn(self._map(attention, grid), target, torch.ones(1, 1))
         self.assertAlmostEqual(metrics["correspondence_target_mass"].item(), 0.3, places=5)
 
+    def test_nll_radius_can_be_configured_per_garment_scale(self):
+        grid = (1, 5)
+        target = grid_coordinates(grid)[2].view(1, 1, 2)
+        attention = torch.zeros(1, 1, 5)
+        attention[0, 0, 3] = 1.0
+        maps = [
+            {"block": 1, "scale": "coarse", "weights": attention, "grid": grid, "key_padding": None},
+            {"block": 2, "scale": "detail", "weights": attention, "grid": grid, "key_padding": None},
+        ]
+        loss_fn = CorrespondenceAttentionLoss(
+            center_weight=0.0,
+            entropy_weight=0.0,
+            nll_weight=1.0,
+            nll_radius={"coarse": 0.21, "detail": 0.05},
+            photometric_weight=0.0,
+        )
+        _, metrics = loss_fn(maps, target, torch.ones(1, 1))
+        self.assertAlmostEqual(metrics["correspondence/coarse/target_mass"].item(), 1.0, places=6)
+        self.assertAlmostEqual(metrics["correspondence/detail/target_mass"].item(), 0.0, places=6)
+
+    def test_per_scale_correspondence_metrics_average_their_blocks(self):
+        grid = (1, 2)
+        target = grid_coordinates(grid)[0].view(1, 1, 2)
+        first = torch.tensor([[[1.0, 0.0]]])
+        second = torch.tensor([[[0.5, 0.5]]])
+        detail = torch.tensor([[[0.0, 1.0]]])
+        maps = [
+            {"block": 1, "scale": "middle", "weights": first, "grid": grid, "key_padding": None},
+            {"block": 2, "scale": "middle", "weights": second, "grid": grid, "key_padding": None},
+            {"block": 3, "scale": "detail", "weights": detail, "grid": grid, "key_padding": None},
+        ]
+        loss_fn = CorrespondenceAttentionLoss(nll_radius=0.1, photometric_weight=0.0)
+        _, metrics = loss_fn(maps, target, torch.ones(1, 1))
+        self.assertAlmostEqual(metrics["correspondence/middle/target_mass"].item(), 0.75, places=6)
+        self.assertAlmostEqual(metrics["correspondence/detail/target_mass"].item(), 0.0, places=6)
+        self.assertIn("correspondence/middle/nll", metrics)
+        self.assertIn("correspondence/middle/entropy", metrics)
+
     def test_photometric_loss_penalises_retrieving_the_garment_mean(self):
         """Exactly the observed defect: every person token retrieving the same average
         colour rather than the colour it needs."""

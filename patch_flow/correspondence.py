@@ -37,6 +37,7 @@ time, and disappears entirely at inference.
 """
 
 import math
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -275,11 +276,29 @@ class CorrespondenceAttentionLoss(nn.Module):
         self.center_weight = float(center_weight)
         self.entropy_weight = float(entropy_weight)
         self.nll_weight = float(nll_weight)
-        self.nll_radius = float(nll_radius)
+        if isinstance(nll_radius, Mapping):
+            self.nll_radius = {str(scale): float(radius) for scale, radius in nll_radius.items()}
+            if not self.nll_radius:
+                raise ValueError("nll_radius mapping must contain at least one garment scale")
+        else:
+            self.nll_radius = float(nll_radius)
         self.photometric_weight = float(photometric_weight)
         self.entropy_eps = float(entropy_eps)
-        if not 0 < self.nll_radius < 1:
-            raise ValueError("nll_radius is in normalised garment units and must be in (0, 1)")
+        radii = self.nll_radius.values() if isinstance(self.nll_radius, dict) else (self.nll_radius,)
+        if any(not 0 < radius < 1 for radius in radii):
+            raise ValueError("nll_radius values are in normalised garment units and must be in (0, 1)")
+
+    def _nll_radius_for_scale(self, scale):
+        if not isinstance(self.nll_radius, dict):
+            return self.nll_radius
+        try:
+            return self.nll_radius[scale]
+        except KeyError as error:
+            configured = ", ".join(sorted(self.nll_radius))
+            raise ValueError(
+                f"No correspondence NLL radius configured for garment scale '{scale}'; "
+                f"configured scales: {configured}"
+            ) from error
 
     @property
     def needs_target(self):
@@ -317,11 +336,23 @@ class CorrespondenceAttentionLoss(nn.Module):
         )
 
         totals = {"center": zero, "entropy": zero, "nll": zero, "photometric": zero, "mass": zero}
+        scale_totals = {}
         metrics = {}
         for entry in attention_maps:
             attention = entry["weights"].float()
             grid = entry["grid"]
-            prefix = f"correspondence/block_{entry['block']:02d}_{entry['scale']}"
+            scale = entry["scale"]
+            prefix = f"correspondence/block_{entry['block']:02d}_{scale}"
+            if scale not in scale_totals:
+                scale_totals[scale] = {
+                    "center": zero,
+                    "entropy": zero,
+                    "nll": zero,
+                    "photometric": zero,
+                    "mass": zero,
+                    "count": 0,
+                }
+            scale_totals[scale]["count"] += 1
             coordinates = grid_coordinates(grid, device=device, dtype=attention.dtype)
             if coordinates.shape[0] != attention.shape[-1]:
                 raise ValueError(
@@ -337,11 +368,17 @@ class CorrespondenceAttentionLoss(nn.Module):
                 denominator = weight.sum().clamp_min(1e-6)
                 center = attention @ coordinates
                 center_loss = ((center - target).square().sum(-1) * weight).sum() / denominator
-                mass = neighbourhood_mass(attention, target, grid, self.nll_radius)
+                radius = self._nll_radius_for_scale(scale)
+                mass = neighbourhood_mass(attention, target, grid, radius)
                 nll_loss = (-torch.log(mass.clamp_min(1e-6)) * weight).sum() / denominator
                 totals["center"] = totals["center"] + center_loss
                 totals["nll"] = totals["nll"] + nll_loss
                 totals["mass"] = totals["mass"] + (mass * weight).sum() / denominator
+                scale_totals[scale]["center"] = scale_totals[scale]["center"] + center_loss
+                scale_totals[scale]["nll"] = scale_totals[scale]["nll"] + nll_loss
+                scale_totals[scale]["mass"] = (
+                    scale_totals[scale]["mass"] + (mass * weight).sum() / denominator
+                )
                 metrics[f"{prefix}/center"] = center_loss.detach()
                 metrics[f"{prefix}/nll"] = nll_loss.detach()
                 metrics[f"{prefix}/target_mass"] = ((mass * weight).sum() / denominator).detach()
@@ -360,6 +397,7 @@ class CorrespondenceAttentionLoss(nn.Module):
                 entropy = entropy / torch.log(keys.clamp_min(2.0))
                 entropy_loss = (entropy * spread_weight).sum() / spread_denominator
                 totals["entropy"] = totals["entropy"] + entropy_loss
+                scale_totals[scale]["entropy"] = scale_totals[scale]["entropy"] + entropy_loss
                 metrics[f"{prefix}/entropy"] = entropy_loss.detach()
 
             if use_photometric:
@@ -373,11 +411,25 @@ class CorrespondenceAttentionLoss(nn.Module):
                 error = (retrieved - appearance["query"].float()).square().sum(-1)
                 photometric_loss = (error * appearance_weight).sum() / photometric_denominator
                 totals["photometric"] = totals["photometric"] + photometric_loss
+                scale_totals[scale]["photometric"] = (
+                    scale_totals[scale]["photometric"] + photometric_loss
+                )
                 metrics[f"{prefix}/photometric"] = photometric_loss.detach()
 
         count = len(attention_maps)
         for key in totals:
             totals[key] = totals[key] / count
+        for scale, scale_values in scale_totals.items():
+            scale_count = scale_values.pop("count")
+            averaged = {key: value / scale_count for key, value in scale_values.items()}
+            metrics[f"correspondence/{scale}/nll"] = averaged["nll"].detach()
+            metrics[f"correspondence/{scale}/center"] = averaged["center"].detach()
+            metrics[f"correspondence/{scale}/entropy"] = averaged["entropy"].detach()
+            metrics[f"correspondence/{scale}/photometric"] = averaged["photometric"].detach()
+            metrics[f"correspondence/{scale}/target_mass"] = averaged["mass"].detach()
+            metrics[f"correspondence/{scale}/appearance_error"] = (
+                averaged["photometric"].detach().clamp_min(0).sqrt()
+            )
         loss = (
             self.nll_weight * totals["nll"]
             + self.center_weight * totals["center"]
