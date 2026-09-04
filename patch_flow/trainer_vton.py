@@ -64,6 +64,11 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         self.correspondence_warmup_steps = int(correspondence_warmup_steps)
         if self.correspondence_warmup_steps < 0:
             raise ValueError("correspondence_warmup_steps must be non-negative")
+        # Own optimizer-step counter. LightningModule.global_step is not usable under the
+        # accelerate loop in train.py: depending on the Lightning version it either does
+        # not exist until train.py assigns it after the first optimizer step, or it is a
+        # read-only property pinned at 0 because no Trainer is ever attached.
+        self._optimizer_steps = 0
         self.correspondence_teacher = None
         if self.correspondence_loss.enabled:
             self.correspondence_teacher = DinoCorrespondenceTeacher(
@@ -220,10 +225,25 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             garment_mask = garment_mask * keep_image.to(garment_mask.dtype)
         return conditions, garment_mask, keep
 
+    def _training_step_count(self):
+        """Optimizer steps taken so far.
+
+        Prefers Lightning's counter when a real Trainer drives training, and falls back to
+        the local one under the accelerate loop, where Lightning's is absent or stuck at 0.
+        """
+        step = getattr(self, "global_step", None)
+        if isinstance(step, int) and step > 0:
+            return step
+        return self._optimizer_steps
+
     def _correspondence_ramp(self):
         if self.correspondence_warmup_steps <= 0:
             return 1.0
-        return min(1.0, float(self.global_step) / self.correspondence_warmup_steps)
+        return min(1.0, self._training_step_count() / self.correspondence_warmup_steps)
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        super().on_train_batch_end(outputs, batch, batch_idx)
+        self._optimizer_steps += 1
 
     @torch.no_grad()
     def _correspondence_targets(self, batch, encoded, edit_tokens, keep):

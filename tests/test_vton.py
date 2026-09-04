@@ -192,6 +192,51 @@ class VTONTests(unittest.TestCase):
         self.assertAlmostEqual(gated.item(), 0.0, places=6)
         self.assertGreater(loss_fn(maps, target, torch.ones(1, 2))[0].item(), 0.0)
 
+    def test_warmup_ramp_advances_without_a_lightning_trainer(self):
+        """train.py drives this module with accelerate, not a Lightning Trainer. Depending
+        on the Lightning version ``global_step`` is then either missing (it raises until
+        train.py assigns it after the first optimizer step) or a read-only property pinned
+        at 0. Either way the ramp has to come from the module's own counter."""
+        trainer = object.__new__(LatentVTONPatchForcingTrainer)
+        # What the real base hook touches: no Lightning Trainer, no scheduler, no EMA.
+        trainer.__dict__.update(
+            {"_trainer": None, "lr_scheduler_cfg": None, "ema_model": None, "_optimizer_steps": 0}
+        )
+        trainer.correspondence_warmup_steps = 4
+
+        for missing_global_step in (True, False):
+            with self.subTest(missing_global_step=missing_global_step):
+                if missing_global_step:
+                    # Reading raises, exactly as nn.Module.__getattr__ does.
+                    patcher = patch.object(
+                        LatentVTONPatchForcingTrainer,
+                        "global_step",
+                        property(lambda self: (_ for _ in ()).throw(AttributeError("global_step"))),
+                    )
+                else:
+                    patcher = patch.object(
+                        LatentVTONPatchForcingTrainer, "global_step", property(lambda self: 0)
+                    )
+                with patcher:
+                    trainer._optimizer_steps = 0
+                    self.assertEqual(trainer._correspondence_ramp(), 0.0)
+                    for _ in range(2):
+                        LatentVTONPatchForcingTrainer.on_train_batch_end(trainer, None, None, 0)
+                    self.assertEqual(trainer._correspondence_ramp(), 0.5)
+                    for _ in range(10):
+                        LatentVTONPatchForcingTrainer.on_train_batch_end(trainer, None, None, 0)
+                    # Clamped, never past 1.
+                    self.assertEqual(trainer._correspondence_ramp(), 1.0)
+
+        # A real Lightning Trainer's counter wins once it is actually advancing.
+        with patch.object(LatentVTONPatchForcingTrainer, "global_step", property(lambda self: 3)):
+            trainer._optimizer_steps = 0
+            self.assertEqual(trainer._correspondence_ramp(), 0.75)
+
+        # Zero warmup short-circuits before any counter is consulted.
+        trainer.correspondence_warmup_steps = 0
+        self.assertEqual(trainer._correspondence_ramp(), 1.0)
+
     def test_entropy_is_normalised_by_the_usable_key_count(self):
         """Branches with different key counts must contribute comparably, so a uniform
         distribution scores 1.0 whether it spans 4 keys or 2."""
