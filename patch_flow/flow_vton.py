@@ -5,7 +5,7 @@ from jutils import instantiate_from_config
 
 from patch_flow.vton_utils import prepare_vton_masks
 
-GARMENT_CONDITION_KEYS = ("garment_features", "garment", "garment_middle", "garment_detail")
+GARMENT_CONDITION_KEYS = ("garment", "garment_middle", "garment_detail")
 
 
 class VTONPatchFlowForcing:
@@ -164,7 +164,6 @@ class VTONPatchFlowForcing:
         x,
         person_agnostic,
         edit_mask,
-        garment_features=None,
         garment=None,
         garment_middle=None,
         garment_detail=None,
@@ -186,7 +185,6 @@ class VTONPatchFlowForcing:
         if adaptive and inner_steps < 2:
             raise ValueError("Adaptive sampling requires at least two inner steps")
         garment_conditions = dict(
-            garment_features=garment_features,
             garment=garment,
             garment_middle=garment_middle,
             garment_detail=garment_detail,

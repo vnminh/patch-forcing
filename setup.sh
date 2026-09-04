@@ -11,7 +11,7 @@ vae_original_path="$checkpoints_dir/vae-ft-ema-560000-ema-pruned.ckpt"
 vae_path="$checkpoints_dir/sd_ae.ckpt"
 pft_url=${PFT_XL_URL:-https://ommer-lab.com/files/pft/pft-xl_step400k_ema.ckpt}
 vae_url=${SD_VAE_URL:-https://huggingface.co/stabilityai/sd-vae-ft-ema-original/resolve/main/vae-ft-ema-560000-ema-pruned.ckpt}
-dino_model=${DINO_MODEL:-facebook/dinov2-small}
+teacher_model=${CORRESPONDENCE_TEACHER:-facebook/dinov3-vits16-pretrain-lvd1689m}
 vae_sha256=0b204ad0cae549e0a7e298d803d57e36363760dec71c63109c1da3e1147ec520
 activation_command="current environment"
 
@@ -77,7 +77,15 @@ fi
 mkdir -p "$checkpoints_dir"
 download_file "$pft_url" "$pft_path"
 download_file "$vae_url" "$vae_original_path"
-DINO_MODEL="$dino_model" python -c 'import os; from transformers import Dinov2Model; Dinov2Model.from_pretrained(os.environ["DINO_MODEL"])'
+# The correspondence teacher is training-time only, and its repository is gated, so a
+# failure here is a warning rather than a setup failure: inference never needs it, and
+# training can run with correspondence_center_weight=0.
+CORRESPONDENCE_TEACHER="$teacher_model" python -c 'import os; from transformers import AutoModel; AutoModel.from_pretrained(os.environ["CORRESPONDENCE_TEACHER"])' || {
+    echo "Warning: could not fetch $teacher_model."
+    echo "It is gated on Hugging Face; set HF_TOKEN for an account with access,"
+    echo "or train with trainer.params.correspondence_center_weight=0 and"
+    echo "trainer.params.correspondence_entropy_weight=0."
+}
 
 echo "$vae_sha256  $vae_original_path" | sha256sum --check --status || {
     echo "VAE checksum verification failed: $vae_original_path"
@@ -100,4 +108,4 @@ echo "Setup complete."
 echo "Activate with: $activation_command"
 echo "Set PFT_XL_CKPT=$pft_path"
 echo "VAE checkpoint: $vae_path"
-echo "DINO garment encoder: $dino_model"
+echo "Correspondence teacher: $teacher_model"

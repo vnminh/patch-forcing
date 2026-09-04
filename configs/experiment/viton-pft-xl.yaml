@@ -12,7 +12,7 @@ model:
   params:
     garment_middle_channels: 256
     garment_detail_channels: 128
-    garment_scale_routes: [dino, dino, coarse, middle, middle, detail, detail]
+    garment_scale_routes: [coarse, coarse, coarse, middle, middle, detail, detail]
 
 data:
   params:

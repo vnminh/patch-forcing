@@ -14,7 +14,6 @@ sys.path.insert(0, repo_dir)
 
 from jutils import instantiate_from_config
 
-from patch_flow.dino_garment import TrainableDinoGarmentEncoder
 from patch_flow.models.pf_transformer_vton import VTONPatchForcingDiT
 from patch_flow.vae_features import encode_vae_pyramid
 from patch_flow.vton_data import _letterbox
@@ -52,27 +51,8 @@ def main(args):
     state = VTONPatchForcingDiT._select_checkpoint_state(checkpoint, use_ema=not args.no_ema)
     model.load_state_dict(state, strict=True)
     model = model.to(device).eval()
-    encoder_prefix = "garment_encoder."
-    encoder_state = {
-        key[len(encoder_prefix) :]: value
-        for key, value in checkpoint["state_dict"].items()
-        if key.startswith(encoder_prefix)
-    }
-    garment_encoder = None
-    if getattr(model, "use_dino_garment", False):
-        if not encoder_state:
-            raise ValueError("Checkpoint does not contain the trainable DINO garment encoder")
-        garment_encoder_name = args.dino_model or hyper_parameters.get(
-            "garment_encoder_name", "facebook/dinov2-small"
-        )
-        garment_encoder_input_size = hyper_parameters.get("garment_encoder_input_size", (448, 336))
-        garment_encoder = TrainableDinoGarmentEncoder(
-            model_name=garment_encoder_name,
-            trainable_blocks=0,
-            input_size=garment_encoder_input_size,
-        )
-        garment_encoder.load_state_dict(encoder_state, strict=True)
-        garment_encoder = garment_encoder.to(device).eval()
+    # The correspondence teacher is a training-time-only supervisor; inference needs
+    # nothing but the SD VAE.
     autoencoder = instantiate_from_config(hyper_parameters["first_stage"]).to(device).eval()
     flow = instantiate_from_config(hyper_parameters["flow"])
 
@@ -86,7 +66,6 @@ def main(args):
         agnostic_latent = autoencoder.encode(person_agnostic_image)
         masks = flow.prepare_masks(edit_mask, agnostic_latent.shape[-2:], agnostic_latent.dtype)
         person_context = agnostic_latent * (1 - masks.latent)
-        garment_features = garment_encoder(garment_image) if garment_encoder is not None else None
         garment_latent = None
         garment_middle = None
         garment_detail = None
@@ -112,7 +91,6 @@ def main(args):
             person_condition_mask=masks.condition,
             edit_mask=edit_mask,
             garment_mask=garment_mask,
-            garment_features=garment_features,
             garment=garment_latent,
             garment_middle=garment_middle,
             garment_detail=garment_detail,
@@ -152,7 +130,6 @@ if __name__ == "__main__":
     parser.add_argument("--inner-steps", type=int, default=3)
     parser.add_argument("--feather-radius", type=int, default=8)
     parser.add_argument("--no-ema", action="store_true")
-    parser.add_argument("--dino-model")
     args = parser.parse_args()
     if (args.height is None) != (args.width is None):
         parser.error("--height and --width must be specified together")

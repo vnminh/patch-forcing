@@ -18,7 +18,7 @@ model:
     garment_middle_channels: 256
     garment_detail_channels: 128
     cross_attention_every: 2
-    garment_scale_routes: [dino, dino, coarse, coarse, middle, middle, middle, middle,
+    garment_scale_routes: [coarse, coarse, coarse, coarse, middle, middle, middle, middle,
                             detail, detail, detail, detail, detail, detail]
 
 trainer:
@@ -26,6 +26,7 @@ trainer:
     ema_rate: 0.0
     train_adapters_only: true
     compute_validation_metrics: false
+    correspondence_scales: [coarse, middle]
     sample_kwargs:
       num_steps: 8
       cfg_scale: 1.0

@@ -5,8 +5,8 @@ from torchvision.utils import save_image
 
 from jutils import exists
 
+from patch_flow.correspondence import CorrespondenceAttentionLoss, DinoCorrespondenceTeacher
 from patch_flow.diagonal_gaussian import DiagonalGaussian
-from patch_flow.dino_garment import TrainableDinoGarmentEncoder
 from patch_flow.log_utils import log_images
 from patch_flow.trainer import LatentFlowTrainer, un_normalize_ims
 from patch_flow.vae_features import encode_vae_pyramid
@@ -21,12 +21,17 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         outside_velocity_weight=0.01,
         detail_loss_weight=0.0,
         garment_dropout_prob=0.1,
-        use_dino_garment=True,
-        garment_encoder_name="facebook/dinov2-small",
-        garment_encoder_trainable_blocks=0,
-        garment_encoder_input_size=(448, 336),
-        garment_encoder_gradient_checkpointing=False,
-        garment_encoder_lr=2e-5,
+        correspondence_center_weight=1.0,
+        correspondence_entropy_weight=0.05,
+        correspondence_teacher_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+        correspondence_teacher_input_size=(512, 384),
+        correspondence_garment_grid=None,
+        correspondence_min_similarity=0.35,
+        correspondence_soft_target_temperature=0.0,
+        correspondence_mutual=False,
+        correspondence_weight_by_similarity=False,
+        correspondence_scales=None,
+        correspondence_warmup_steps=0,
         train_adapters_only=False,
         backbone_lr_multiplier=0.1,
         compute_validation_metrics=True,
@@ -39,25 +44,33 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         self.outside_velocity_weight = float(outside_velocity_weight)
         self.detail_loss_weight = float(detail_loss_weight)
         self.garment_dropout_prob = float(garment_dropout_prob)
-        self.garment_encoder_lr = float(garment_encoder_lr)
-        self.use_dino_garment = bool(use_dino_garment) and getattr(self.model, "use_dino_garment", True)
-        self.garment_encoder = None
-        if self.use_dino_garment:
-            self.garment_encoder = TrainableDinoGarmentEncoder(
-                model_name=garment_encoder_name,
-                trainable_blocks=garment_encoder_trainable_blocks,
-                input_size=garment_encoder_input_size,
-                gradient_checkpointing=garment_encoder_gradient_checkpointing,
-            )
-            if self.garment_encoder.feature_dim != self.model.garment_feature_dim:
-                raise ValueError(
-                    f"DINO feature dimension {self.garment_encoder.feature_dim} does not match "
-                    f"model garment_feature_dim {self.model.garment_feature_dim}"
-                )
         self.use_vae_garment = bool(getattr(self.model, "use_vae_garment", False))
         self.use_multiscale_garment = bool(getattr(self.model, "use_multiscale_garment", False))
-        if not (self.use_dino_garment or self.use_vae_garment or self.use_multiscale_garment):
+        if not (self.use_vae_garment or self.use_multiscale_garment):
             raise ValueError("At least one garment conditioning branch must be enabled")
+
+        # CORAL-style correspondence supervision. The teacher is a training-time-only
+        # frozen DINOv3; nothing it produces is fed to the network, so inference is
+        # unchanged and the checkpointed conditioning path stays pure SD-VAE.
+        self.correspondence_loss = CorrespondenceAttentionLoss(
+            center_weight=correspondence_center_weight,
+            entropy_weight=correspondence_entropy_weight,
+        )
+        self.correspondence_min_similarity = float(correspondence_min_similarity)
+        self.correspondence_soft_target_temperature = float(correspondence_soft_target_temperature)
+        self.correspondence_mutual = bool(correspondence_mutual)
+        self.correspondence_weight_by_similarity = bool(correspondence_weight_by_similarity)
+        self.correspondence_scales = None if correspondence_scales is None else list(correspondence_scales)
+        self.correspondence_warmup_steps = int(correspondence_warmup_steps)
+        if self.correspondence_warmup_steps < 0:
+            raise ValueError("correspondence_warmup_steps must be non-negative")
+        self.correspondence_teacher = None
+        if self.correspondence_loss.enabled:
+            self.correspondence_teacher = DinoCorrespondenceTeacher(
+                model_name=correspondence_teacher_name,
+                input_size=correspondence_teacher_input_size,
+                garment_grid=correspondence_garment_grid,
+            )
         self.backbone_lr_multiplier = float(backbone_lr_multiplier)
         self.train_adapters_only = bool(train_adapters_only)
         self.compute_validation_metrics = bool(compute_validation_metrics)
@@ -75,13 +88,10 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
     def configure_optimizers(self):
         adapter_parameters = []
         backbone_parameters = []
-        garment_encoder_parameters = []
         for name, parameter in self.named_parameters():
             if not parameter.requires_grad:
                 continue
-            if name.startswith("garment_encoder."):
-                garment_encoder_parameters.append(parameter)
-            elif "garment_" in name or ".x_embedder" in name:
+            if "garment_" in name or ".x_embedder" in name:
                 adapter_parameters.append(parameter)
             else:
                 backbone_parameters.append(parameter)
@@ -90,8 +100,6 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             groups.append({"params": adapter_parameters, "lr": self.lr})
         if backbone_parameters:
             groups.append({"params": backbone_parameters, "lr": self.lr * self.backbone_lr_multiplier})
-        if garment_encoder_parameters:
-            groups.append({"params": garment_encoder_parameters, "lr": self.garment_encoder_lr})
         optimizer = torch.optim.AdamW(groups, lr=self.lr, weight_decay=self.weight_decay)
         output = {"optimizer": optimizer}
         if exists(self.lr_scheduler_cfg):
@@ -131,7 +139,6 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             )
 
         embedders = {
-            "dino": self.model.garment_feature_proj,
             "coarse": self.model.garment_embedder.proj if self.model.garment_embedder is not None else None,
             "middle": self.model.garment_middle_embedder,
             "detail": self.model.garment_detail_embedder,
@@ -178,7 +185,6 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             garment_latent = self.encode(garment)
         if not self.use_vae_garment:
             garment_latent = None
-        garment_features = self.garment_encoder(garment) if self.use_dino_garment else None
         return {
             "target_image": target,
             "person_image": batch.get("person", target),
@@ -186,24 +192,22 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             "target": target_latent,
             "person_context": person_context,
             "masks": masks,
-            "garment_features": garment_features,
             "garment": garment_latent,
             "garment_middle": garment_middle,
             "garment_detail": garment_detail,
         }
 
     def _garment_conditions(self, encoded):
-        return {
-            key: encoded[key]
-            for key in ("garment_features", "garment", "garment_middle", "garment_detail")
-        }
+        return {key: encoded[key] for key in ("garment", "garment_middle", "garment_detail")}
 
     def _drop_garment(self, conditions, garment_mask):
+        """Classifier-free dropout. Also returns the per-sample keep flag, because a
+        dropped sample has no garment to correspond to and must not be supervised."""
         if not self.training or self.garment_dropout_prob <= 0:
-            return conditions, garment_mask
+            return conditions, garment_mask, None
         reference = next((value for value in conditions.values() if value is not None), None)
         if reference is None:
-            return conditions, garment_mask
+            return conditions, garment_mask, None
         keep = (
             torch.rand(reference.shape[0], device=reference.device) >= self.garment_dropout_prob
         ).to(reference.dtype)
@@ -214,7 +218,35 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         }
         if garment_mask is not None:
             garment_mask = garment_mask * keep_image.to(garment_mask.dtype)
-        return conditions, garment_mask
+        return conditions, garment_mask, keep
+
+    def _correspondence_ramp(self):
+        if self.correspondence_warmup_steps <= 0:
+            return 1.0
+        return min(1.0, float(self.global_step) / self.correspondence_warmup_steps)
+
+    @torch.no_grad()
+    def _correspondence_targets(self, batch, encoded, edit_tokens, keep):
+        """Frozen-DINOv3 person->garment matches, as (target uv, supervision weight)."""
+        teacher = self.correspondence_teacher
+        person_grid = (
+            encoded["target"].shape[-2] // self.flow.patch_size,
+            encoded["target"].shape[-1] // self.flow.patch_size,
+        )
+        target, weight, similarity = teacher.correspondence(
+            encoded["person_image"],
+            batch["garment"],
+            person_grid=person_grid,
+            garment_mask=batch.get("garment_mask"),
+            person_valid=edit_tokens,
+            min_similarity=self.correspondence_min_similarity,
+            soft_target_temperature=self.correspondence_soft_target_temperature,
+            mutual=self.correspondence_mutual,
+            weight_by_similarity=self.correspondence_weight_by_similarity,
+        )
+        if keep is not None:
+            weight = weight * keep[:, None].to(weight.dtype)
+        return target, weight, similarity
 
     @staticmethod
     def _detail_loss(predicted, target, mask):
@@ -234,7 +266,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         encoded = self._encode_batch(batch)
         target = encoded["target"]
         masks = encoded["masks"]
-        conditions, garment_mask = self._drop_garment(
+        conditions, garment_mask, keep = self._drop_garment(
             self._garment_conditions(encoded), batch.get("garment_mask")
         )
         xt, ut, timesteps, masks = self.flow.get_interpolants(
@@ -244,7 +276,10 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             masks=masks,
         )
         label = self._label(batch, target.shape[0], target.device)
-        velocity, logvar = self.model(
+        supervise_correspondence = (
+            self.training and self.correspondence_teacher is not None and self._correspondence_ramp() > 0
+        )
+        output = self.model(
             x=xt,
             t=timesteps,
             y=label,
@@ -253,8 +288,15 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             edit_mask=masks.condition,
             garment_mask=garment_mask,
             return_uncertainty=True,
+            return_garment_attention=supervise_correspondence,
+            garment_attention_scales=self.correspondence_scales,
             **conditions,
         )
+        attention_maps = []
+        if supervise_correspondence:
+            velocity, logvar, attention_maps = output
+        else:
+            velocity, logvar = output
 
         flow_loss = masked_mean((velocity - ut).square(), masks.latent)
         outside = 1 - masks.latent
@@ -281,6 +323,26 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             detail_loss = self._detail_loss(predicted_clean, target, masks.latent)
             loss = loss + self.detail_loss_weight * detail_loss
             metrics["detail_loss"] = detail_loss
+        if attention_maps:
+            correspondence_target, correspondence_weight, similarity = self._correspondence_targets(
+                batch, encoded, masks.token, keep
+            )
+            correspondence_loss, correspondence_metrics = self.correspondence_loss(
+                attention_maps, correspondence_target, correspondence_weight
+            )
+            ramp = self._correspondence_ramp()
+            loss = loss + ramp * correspondence_loss
+            metrics.update(correspondence_metrics)
+            metrics["correspondence_loss"] = correspondence_loss.detach()
+            metrics["correspondence_ramp"] = torch.as_tensor(ramp, device=loss.device)
+            editable = masks.token.float().sum().clamp_min(1)
+            # How much of the editable region the teacher was confident enough to supervise,
+            # and how strong those matches were. If coverage collapses, min_similarity is
+            # too aggressive and the loss is silently doing nothing.
+            metrics["correspondence_coverage"] = (correspondence_weight > 0).float().sum() / editable
+            metrics["correspondence_similarity"] = (
+                similarity * masks.token.float()
+            ).sum() / editable
         return loss, metrics
 
     @torch.no_grad()

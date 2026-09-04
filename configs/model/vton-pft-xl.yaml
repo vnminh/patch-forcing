@@ -8,10 +8,9 @@ params:
   num_heads: 16
   num_classes: 1000
   predict_uncertainty: true
-  # Semantic garment branch: establishes garment/body correspondence.
-  use_dino_garment: true
-  garment_feature_dim: 384
-  # Appearance-faithful garment branches: transport colour blocks, logos and text.
+  # Multiscale SD-VAE garment branches: they transport colour blocks, logos and text, and
+  # they are the only garment conditioning. Correspondence is no longer a fourth key set;
+  # it is supervised directly on these branches' attention maps (see trainer config).
   use_vae_garment: true
   garment_middle_channels: null
   garment_detail_channels: null

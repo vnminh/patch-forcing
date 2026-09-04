@@ -30,15 +30,35 @@ params:
   # high-frequency garment structure harder.
   detail_loss_weight: 0.05
   garment_dropout_prob: 0.1
-  use_dino_garment: true
-  garment_encoder_name: facebook/dinov2-small
-  # Frozen. DINO only supplies semantic correspondence now that the VAE branches carry
-  # appearance, and pretrained DINOv2 is already strong at that. Raise this only to run
-  # the unfreezing ablation; garment_encoder_lr applies solely when it is > 0.
-  garment_encoder_trainable_blocks: 0
-  garment_encoder_input_size: [448, 336]
-  garment_encoder_gradient_checkpointing: false
-  garment_encoder_lr: 2.0e-5
+  # ---- CORAL-style correspondence supervision -------------------------------------
+  # A frozen DINOv3 teacher matches each editable person token to a garment token by
+  # cosine similarity; that match is the ground-truth position for the garment
+  # cross-attention. Training-time only: nothing here is fed to the network, so
+  # inference and the exported checkpoint's conditioning path stay pure SD-VAE.
+  # Pull the attention barycentre onto the matched garment position.
+  correspondence_center_weight: 1.0
+  # Sharpen the distribution. Without it, attending uniformly to a symmetric
+  # neighbourhood satisfies the barycentre term exactly as well as attending to the
+  # right token. Small: too large collapses attention before placement is learned.
+  correspondence_entropy_weight: 0.05
+  correspondence_teacher_name: facebook/dinov3-vits16-pretrain-lvd1689m
+  # null keeps the dataset resolution (rounded to the teacher patch grid), so the
+  # letterboxed aspect ratio is preserved and matched positions are not sheared.
+  correspondence_teacher_input_size: null
+  correspondence_garment_grid: null
+  # Confidence gate on the best cosine similarity. Watch train/correspondence_coverage:
+  # if it collapses toward 0 the gate is too aggressive and the loss does nothing.
+  correspondence_min_similarity: 0.35
+  # > 0 replaces the arg-max match with a softmax-weighted target position.
+  correspondence_soft_target_temperature: 0.0
+  # Cycle consistency: the matched garment token must match back. Higher precision,
+  # lower coverage.
+  correspondence_mutual: false
+  correspondence_weight_by_similarity: false
+  # null supervises every cross-attention block. Restrict to e.g. [coarse, middle] to
+  # avoid materialising the detail branch's much larger attention matrices.
+  correspondence_scales: null
+  correspondence_warmup_steps: 0
   train_adapters_only: false
   save_validation_previews: true
   preview_every_n_validations: 1

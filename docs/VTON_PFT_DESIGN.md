@@ -11,7 +11,7 @@ The training sample contains:
 | \(I^*\) | `image` | Complete paired ground-truth person image |
 | \(I_p\) | `person` | Person image used to construct the agnostic input |
 | \(I_a\) | `person_agnostic` | Person with the original garment removed |
-| \(I_g\) | `garment` | In-shop garment image; encoded by DINO **and** the VAE pyramid |
+| \(I_g\) | `garment` | In-shop garment image; encoded by the SD-VAE pyramid |
 | \(M\) | `agnostic_mask` | Region allowed to change; 1 means editable |
 | \(M_g\) | `garment_mask` | Foreground mask for garment attention tokens |
 
@@ -28,8 +28,7 @@ Person Ip ---> supplied agnostic mask M ---> token-grid rounding only
           ---> RGB mask M_T ---> remove garment before VAE
           ---> frozen VAE encoder -------------------------------> agnostic latent za
 
-Garment Ig ---> frozen DINOv2-small --------------------------> semantic features fg
-           ---> frozen VAE encoder ---> latent zg -------------> coarse appearance tokens
+Garment Ig ---> frozen VAE encoder ---> latent zg -------------> coarse appearance tokens
                                    \--> 1/4-res feature map --> middle appearance tokens
                                    \--> 1/2-res feature map --> detail appearance tokens
 Garment mask Mg -------------------------------------------------> garment token key mask
@@ -37,7 +36,7 @@ Garment mask Mg -------------------------------------------------> garment token
 Noise epsilon + z* + za + token times --------------------------> evolving latent xt
 
 [xt, za, interpolated mask] ---> zero-initialized input extension
-fg, zg, middle, detail + Mg --> routed garment cross-attention
+zg, middle, detail + Mg ------> routed garment cross-attention
 per-token time ---------------> per-token AdaLN modulation
                                      |
                               pretrained PFT-XL
@@ -51,12 +50,17 @@ per-token time ---------------> per-token AdaLN modulation
 original person RGB + feathered edit mask ---> exact outside-mask composite
 ```
 
-Garment appearance travels on four branches, not one. The DINO branch answers *which
-garment region belongs where on the body*; the three VAE branches answer *what that
-region actually looks like*. A DINO-only condition can only reproduce garment category
-and mean colour, because DINOv2 patch features are trained to be invariant to exactly
-the appearance detail a try-on model has to copy: printed text, logos, and
-colour-block seams.
+Garment appearance travels on three VAE branches at three resolutions. They answer
+*what a garment region looks like*; the separate question of *which garment region
+belongs where on the body* is no longer answered by a fourth key set but supervised
+directly on these branches' attention maps (section 10.4).
+
+There is deliberately no DINO conditioning branch. DINOv2 patch features are trained to
+be invariant to exactly the appearance detail a try-on model has to copy — printed text,
+logos, colour-block seams — so as keys they contributed correspondence and nothing else,
+while costing an encoder at inference, a fourth attention route, and blocks that carried
+no appearance at all. The correspondence signal is worth more applied as a loss than
+offered as a key.
 
 The full person latent is never used as clean context. This matters because masking a latent after encoding is insufficient: the VAE encoder has a spatial receptive field, so garment texture can already have spread into latent cells outside the nominal mask.
 
@@ -357,13 +361,12 @@ Inside the hard editable region, the explicit agnostic latent is zero. Pose and 
 
 Garment appearance is injected through cross-attention in every fourth transformer block
 — blocks 4, 8, 12, 16, 20, 24, and 28 — and each of those seven blocks is *routed* to one
-of four garment branches.
+of three garment branches. Every branch is an SD-VAE tap.
 
-### 10.1 The four branches
+### 10.1 The three branches
 
 | Branch | Source | Channels | Token grid at 512x384 | Tokens | What it carries |
 |---|---|---|---|---|---|
-| `dino` | **frozen** DINOv2-small at 448x336 | 384 | 32x24 | 768 | semantics; garment/body correspondence |
 | `coarse` | garment VAE latent \(z_g=E(I_g)\) | 4 | 32x24 | 768 | global appearance in the backbone's own latent space |
 | `middle` | SD-VAE encoder 1/4-resolution feature map | 256 | 32x24 | 768 | mid-frequency appearance |
 | `detail` | SD-VAE encoder 1/2-resolution feature map | 128 | **64x48** | **3072** | high-frequency appearance: glyphs, print edges, seams |
@@ -375,50 +378,38 @@ embedded by 4x4-stride convolutions. The `detail` branch is the only branch with
 grid than the person stream: four times the spatial resolution, at roughly 8 input pixels
 per token instead of 16.
 
-### 10.1.1 Why DINO is frozen
+### 10.1.1 Why every branch is a VAE tap
 
-`garment_encoder_trainable_blocks` defaults to `0`. Once the VAE branches carry
-appearance, the DINO branch has exactly one job — semantic correspondence — and
-pretrained DINOv2 is already a strong off-the-shelf semantic-correspondence extractor.
-Fine-tuning 22M parameters on ~11.6k VITON-HD pairs mostly risks degrading that
-representation for no gain on the thing that was actually broken.
+An earlier revision carried a fourth `dino` branch: frozen DINOv2-small patch features as
+an extra key set. It has been removed.
 
-Freezing also pays for itself directly:
+DINOv2 is trained for correspondence under heavy appearance augmentation, so its patch
+tokens are deliberately invariant to the exact appearance a try-on model must reproduce.
+It can report "dark navy panel here, lavender panel there" but not the shape of a letter.
+So the branch could only ever contribute correspondence — and as a *key set* that
+contribution is indirect: nothing forces the model to use those keys for placement rather
+than ignoring them, and the blocks routed to `dino` carried no appearance at all. It also
+cost an image encoder at inference and 22M parameters in every checkpoint.
 
-- no gradients, no AdamW state for 22M parameters, and no retained DINO activations, which returns memory to the `detail` branch that needs it;
-- DINO gradient checkpointing becomes unnecessary, removing a recompute pass;
-- garment features become deterministic per garment image, so they are precomputable;
-- one fewer moving part while attributing the improvement to the restored VAE branches.
-
-The encoder wraps its forward in `torch.no_grad()` when fully frozen, so no graph is
-built even if a caller passes a graph-connected garment tensor. Raise
-`garment_encoder_trainable_blocks` above 0 only to run the unfreezing ablation;
-`garment_encoder_lr` applies solely in that case. Earlier revisions escalated to a full
-12-block fine-tune to chase garment colour and typography, but that was compensating for
-the missing appearance branches rather than fixing them.
-
-Why four branches rather than one: DINOv2 is trained for correspondence under heavy
-appearance augmentation, so its patch tokens are deliberately invariant to the exact
-appearance a try-on model must reproduce. It can report "dark navy panel here, lavender
-panel there" but not the shape of a letter. The VAE branches are reconstruction-faithful
-by construction and therefore copyable. Using DINO alone yields a garment of the correct
-category and mean colour with no logo, no printed text, and no colour blocking — which is
-precisely the failure this design exists to avoid.
+Section 10.4 replaces it with the same information applied where it acts directly: a
+training-time DINOv3 teacher that supervises *where the VAE branches' attention looks*.
+The VAE branches are reconstruction-faithful by construction and therefore copyable; they
+are the only thing that can transport a logo. Now they also get told where to put it.
 
 ### 10.2 Routing
 
-`garment_scale_routes` assigns one branch to each cross-attention block. The 512-by-384
-configuration uses:
+`garment_scale_routes` assigns one branch to each cross-attention block. The 256 configuration uses:
 
 ```yaml
-garment_scale_routes: [dino, dino, coarse, middle, middle, detail, detail]
+garment_scale_routes: [coarse, coarse, coarse, middle, middle, detail, detail]
 ```
 
-The ordering is deliberate. Establishing correspondence — deciding which part of a
-flat-lay garment belongs at which body location — is a semantic, mid-level problem, so
-the semantic branches come first, while the residual stream is still settling layout.
-Transporting exact appearance is a low-level problem and is placed last, close to the
-output, so fine structure is not washed out by the remaining blocks.
+The ordering is deliberate, coarse to fine. Placement — deciding which part of a flat-lay
+garment belongs at which body location — is a low-resolution decision, so the `coarse`
+branch comes first, while the residual stream is still settling layout; it is also the
+branch the correspondence loss is cheapest to supervise. Transporting exact appearance is
+a high-resolution problem and is placed last, close to the output, so fine structure is
+not washed out by the remaining blocks.
 
 ### 10.3 Attention and token scale
 
@@ -439,7 +430,7 @@ pretrained PFT.
 
 Garment token magnitude matters as much as garment token content. The embedding gain is
 `garment_embed_gain: 1.0`. It was previously 0.1, which had a measurable pathology: with
-LayerNorm-ed DINO features projected at gain 0.1, garment tokens entered at standard
+garment features projected at gain 0.1, garment tokens entered at standard
 deviation 0.07 against a person stream at 1.0, giving cross-attention logits a standard
 deviation of 0.035 across 768 keys. Measured at 768 keys, peak attention probability was
 1.37x uniform — that is, the block returned an essentially unweighted average of every
@@ -452,10 +443,78 @@ initialization; it only flattens the attention.
 tokens are valid keys and values, and it is recomputed per branch at that branch's own
 grid, so the finer `detail` grid gets a correspondingly finer foreground mask.
 
-Positional information differs by branch. The VAE branches receive the DiT grid
-positional embedding at full strength. The DINO branch receives it scaled by a single
-learned scalar initialized to zero, because DINOv2 already carries its own positional
-encoding internally.
+Every branch receives the DiT grid positional embedding at full strength, interpolated to
+that branch's own grid. This is what makes key index and spatial position interchangeable,
+which the correspondence loss below depends on.
+
+### 10.4 Correspondence supervision (CORAL-style)
+
+The flow loss supervises *pixels*, so it constrains placement only through a long and
+noisy credit-assignment path: put the logo in the wrong place, get a slightly worse
+latent MSE. The attention map is where placement is actually decided, so it is supervised
+directly.
+
+**Building the ground truth.** A frozen DINOv3 teacher (`facebook/dinov3-vits16-pretrain-lvd1689m`)
+extracts patch features from the ground-truth person image \(I^*\) — where the garment is
+already worn — and from the in-shop garment \(I_g\). Person features are resized to the
+PFT token grid; garment features stay on the teacher's own grid. Both are L2-normalised
+and matched by cosine similarity:
+
+\[
+j^*(i)=\arg\max_{j \in M_g} \; \langle \hat f^{person}_i, \hat f^{garment}_j \rangle .
+\]
+
+The matched garment token's normalised centre \(c_{j^*(i)} \in [0,1]^2\) is the target
+position for person token \(i\). Only editable tokens participate, only garment tokens
+inside \(M_g\) are candidates, and a match survives only if its similarity clears
+`correspondence_min_similarity`. `correspondence_mutual` additionally requires cycle
+consistency (the chosen garment token must choose that person token back): higher
+precision, lower coverage.
+
+**Centre-of-mass loss.** For a supervised block with attention \(A_{ij}\) over key
+positions \(c_j\),
+
+\[
+\mathcal L_{com}=\frac{\sum_i w_i \left\lVert \sum_j A_{ij} c_j - c_{j^*(i)} \right\rVert^2}{\sum_i w_i}.
+\]
+
+Because positions are normalised to \([0,1]^2\), one target serves every branch regardless
+of its key-grid resolution: the 3072-key `detail` grid and the 768-key `coarse` grid are
+scored in the same coordinate system.
+
+**Entropy loss.** The barycentre is not identifiable on its own — a symmetric blur has
+the same centre of mass as a spike at that centre, so uniform attention over a
+neighbourhood satisfies \(\mathcal L_{com}\) exactly as well as attending to the right
+token. The entropy term removes that degenerate solution:
+
+\[
+\mathcal L_{ent}=\frac{\sum_i w_i H(A_i)/\log N_i}{\sum_i w_i},
+\]
+
+normalised by the entropy of the uniform distribution over that branch's \(N_i\) *usable*
+keys (padded keys excluded), so branches of different key counts contribute comparably.
+It is weighted an order of magnitude below the centre term: sharpening attention before
+it points anywhere useful just locks in a wrong match.
+
+**What this costs, and when.** Nothing at inference. The teacher runs under `no_grad` on
+the ground-truth person image, which exists only during training, and no DINO feature ever
+enters the network. The one training cost is real: `need_weights=True` disables fused
+attention and materialises a \((B, N_q, N_k)\) map per supervised block. At 512-by-384 the
+`detail` branch's map is four times larger than the others, so that configuration sets
+`correspondence_scales: [coarse, middle]` — placement is a coarse-scale property, and the
+detail blocks inherit a settled layout from the residual stream.
+
+**Diagnostics.** `train/correspondence_coverage` is the fraction of editable tokens the
+teacher was confident enough to supervise, and `train/correspondence_similarity` the mean
+best cosine similarity. If coverage collapses toward zero, `correspondence_min_similarity`
+is too aggressive and the loss is silently doing nothing. Per-block
+`correspondence/block_NN_scale/{center,entropy}` show which blocks actually learn to
+point.
+
+Samples whose garment condition was dropped for classifier-free guidance get weight zero:
+there is no garment to correspond to. `correspondence_warmup_steps` ramps both terms in
+linearly, so the attention is not pinned before the freshly initialised garment
+embedders produce anything worth pointing at.
 
 ## 11. Class and garment-free conditioning
 
@@ -622,8 +681,7 @@ Self-attention can use clean face, hair, body boundary, pose, and background tok
 - \(x_t\) represents the current generated state.
 - \(z_a\) represents person identity and spatial context without the old garment.
 - the soft mask identifies the editable boundary.
-- frozen DINO garment tokens establish garment/body correspondence.
-- the `coarse`, `middle`, and `detail` VAE branches carry copyable garment appearance at three spatial scales.
+- the `coarse`, `middle`, and `detail` VAE branches carry copyable garment appearance at three spatial scales, and their attention maps carry garment/body correspondence.
 - \(M_g\) removes irrelevant garment background keys.
 - per-token time tells the model how reliable each spatial token currently is.
 
@@ -639,23 +697,24 @@ The 16 GB smoke configuration uses:
 
 - batch size 1;
 - four-step gradient accumulation;
-- gradient checkpointing across transformer blocks (DINO needs none, being frozen);
+- gradient checkpointing across transformer blocks;
 - adapter, input projection, garment cross-attention, and final-layer training;
 - frozen remaining PFT backbone parameters;
 - no EMA model copy;
 - no FID network;
 - eight-step validation sampling.
 
-The `detail` branch is the dominant new memory cost: at 512-by-384 it contributes 3072
-garment keys per routed block instead of 768. Cross-attention is called with
+The `detail` branch is the dominant memory cost: at 512-by-384 it contributes 3072
+garment keys per routed block instead of 768. Cross-attention is normally called with
 `need_weights=False` so PyTorch can use a memory-efficient attention kernel rather than
-materializing the full 768-by-3072 matrix, but activation memory still rises. The
-512-by-384 experiment therefore uses batch size 8 with four-step accumulation, holding
-the global batch at 32. That is a deliberately conservative starting point: freezing DINO
-gave back its optimizer state, gradients, and backward activations, so a larger batch may
-well fit — measure before assuming. If a run does not fit, halve the batch and double the
-accumulation before changing the routing; dropping a `detail` route is the change that
-costs the most quality.
+materializing the full 768-by-3072 matrix. Correspondence supervision is the exception —
+it needs that matrix — which is why `correspondence_scales` exists and why the 512-by-384
+configuration restricts it to the 768-key `coarse` and `middle` branches. The
+512-by-384 experiment uses batch size 8 with four-step accumulation, holding the global
+batch at 32. That is a deliberately conservative starting point — measure before
+assuming. If a run does not fit, halve the batch and double the accumulation before
+changing the routing; dropping a `detail` route is the change that costs the most
+quality.
 
 This mode is intended to validate data flow, checkpoint transfer, gradients, loss reduction, and paired/unpaired visual outputs. It is not a substitute for the later full-data ablation between adapter-only and broader attention fine-tuning.
 
@@ -664,7 +723,8 @@ This mode is intended to validate data flow, checkpoint transfer, gradients, los
 1. PFT-XL was pretrained on a square grid. The implementation supports 512-by-384 fine-tuning through positional interpolation, but this remains resolution transfer rather than native rectangular pretraining.
 2. One token equals roughly 16 input pixels. This handles small parsing errors but not large category topology changes by itself.
 3. The implementation has no DensePose or explicit pose encoder. It relies on agnostic spatial context and visible body boundaries.
-4. DINO is frozen and is no longer the limiting factor for appearance, since the VAE branches carry it. Exact readable text is bounded by the 1/2-resolution VAE feature grid, the frozen VAE decoder, and the 16-pixel person token. Unfreezing DINO remains available as an ablation, but on a dataset this size it is a forgetting risk rather than an obvious gain.
+4. Exact readable text is bounded by the 1/2-resolution VAE feature grid, the frozen VAE decoder, and the 16-pixel person token.
+8. Correspondence targets come from a DINOv3 teacher, so they are only as good as DINOv3's part-level matching on flat-lay-to-worn pairs. `correspondence_min_similarity` gates the obviously bad matches, but a confidently wrong match is supervised as if it were right. Watch `train/correspondence_coverage` and `train/correspondence_similarity`, and prefer `correspondence_mutual: true` if precision matters more than coverage.
 7. The `detail` branch quadruples the garment key count in the blocks it is routed to. Memory, not quality, is the binding constraint on how many blocks can use it.
 5. Adaptive uncertainty is meaningful only after the head has been trained on the VTON distribution.
 6. Unpaired validation has no pixel-aligned ground truth. It should be judged qualitatively or with garment/person-specific metrics, not SSIM against the input person.
@@ -699,7 +759,7 @@ The tests in `tests/test_vton.py` cover the principal architectural and preserva
 
 | Component | File |
 |---|---|
-| DINO garment encoder (frozen by default) | `patch_flow/dino_garment.py` |
+| DINOv3 correspondence teacher and attention losses | `patch_flow/correspondence.py` |
 | Garment VAE pyramid extraction | `patch_flow/vae_features.py` |
 | VTON PFT architecture and conditioning | `patch_flow/models/pf_transformer_vton.py` |
 | Patchwise time construction and samplers | `patch_flow/flow_vton.py` |
@@ -713,7 +773,7 @@ The tests in `tests/test_vton.py` cover the principal architectural and preserva
 
 ## 20. Minimal training sequence
 
-1. Run `setup.sh` or provide compatible PFT-XL, SD-VAE, and DINOv2-small checkpoints.
+1. Run `setup.sh` or provide compatible PFT-XL and SD-VAE checkpoints. Training additionally downloads the DINOv3 correspondence teacher, which is a gated Hugging Face repository — set `HF_TOKEN` for an account with access, or set `correspondence_center_weight` and `correspondence_entropy_weight` to 0 to train without it.
 2. Generate or transfer the agnostic masks.
 3. Run the 32-sample smoke split and smoke training.
 4. Confirm that the paired result reconstructs the held-out garment and the unpaired result follows the new garment.

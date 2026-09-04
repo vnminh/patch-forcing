@@ -127,7 +127,7 @@ conda activate pft-vton
 export PFT_XL_CKPT="$PWD/checkpoints/pft-xl_step400k_ema.ckpt"
 ```
 
-The script installs the pinned CUDA 12.8 dependencies, downloads PFT-XL, Stability AI's EMA SD VAE, and DINOv2-small, verifies the VAE SHA-256 checksum, converts it to the bare state dictionary expected by `jutils`, and strictly loads the PFT/VAE checkpoints. It is resumable and skips existing downloads. Useful overrides include `ENV_NAME`, `CHECKPOINTS_DIR`, `DINO_MODEL`, `USE_CURRENT_ENV=1`, `SKIP_INSTALL=1`, `SKIP_VERIFY=1`, and `FORCE_DOWNLOAD=1`. Set `INSTALL_FLASH_ATTN=1` only when it is needed and the machine has a compatible CUDA build toolchain.
+The script installs the pinned CUDA 12.8 dependencies, downloads PFT-XL, Stability AI's EMA SD VAE, and the DINOv3 correspondence teacher, verifies the VAE SHA-256 checksum, converts it to the bare state dictionary expected by `jutils`, and strictly loads the PFT/VAE checkpoints. It is resumable and skips existing downloads. Useful overrides include `ENV_NAME`, `CHECKPOINTS_DIR`, `CORRESPONDENCE_TEACHER`, `USE_CURRENT_ENV=1`, `SKIP_INSTALL=1`, `SKIP_VERIFY=1`, and `FORCE_DOWNLOAD=1`. Set `INSTALL_FLASH_ATTN=1` only when it is needed and the machine has a compatible CUDA build toolchain.
 
 We release two [Patch Forcing Transformer](https://ommer-lab.com/files/pft/) checkpoints: [PFT-B](https://ommer-lab.com/files/pft/pft-b_step400k_ema.ckpt) and [PFT-XL](https://ommer-lab.com/files/pft/pft-xl_step400k_ema.ckpt). The checkpoints contain the EMA weights, as well as the model config.
 
@@ -197,7 +197,9 @@ You can use `scripts/t2i_sample.py` to sample images based on a text prompt.
 
 The VTON extension fine-tunes the released PFT-XL checkpoint with a mask-constrained flow, a zero-initialized agnostic-person condition, and routed garment cross-attention. The edit mask is applied before VAE encoding, and only the agnostic latent is used as model context; the complete paired image is used only as the supervised target and final RGB reference. `experiment=viton-pft-xl` uses the native 256x256 PFT latent grid; `experiment=viton-pft-xl-512x384` trains at 512x384.
 
-Garment appearance travels on four branches, routed one per cross-attention block: frozen DINOv2-small features for garment/body correspondence, and three SD-VAE taps — the garment latent, the encoder's 1/4-resolution map, and its 1/2-resolution map — for copyable appearance. The VAE branches are what make logos, printed text, and colour blocking reproducible; DINO features are appearance-invariant by design and on their own yield only the right garment category and mean colour. Configure the assignment with `model.params.garment_scale_routes`.
+Garment appearance travels on three SD-VAE branches, routed one per cross-attention block: the garment latent, the encoder's 1/4-resolution map, and its 1/2-resolution map. These are what make logos, printed text, and colour blocking reproducible, because they are reconstruction-faithful rather than appearance-invariant. Configure the assignment with `model.params.garment_scale_routes`.
+
+Garment/body correspondence is supervised rather than conditioned on. A frozen DINOv3 teacher matches each editable person token to a garment token by cosine similarity on the ground-truth pair, and that match becomes the target position for the cross-attention: a centre-of-mass loss pulls the attention barycentre onto it, and an entropy term stops a diffuse blur from satisfying the barycentre just as well as a spike. This is training-time only — the teacher never feeds the network, and inference needs nothing but the SD VAE. It replaces an earlier DINOv2 conditioning branch, which could only ever contribute correspondence and did so indirectly, as keys the model was free to ignore.
 
 The edit mask is the token-grid rounding of the supplied agnostic mask, with no dilation, and dilation is not configurable. On VITON-HD, one token of dilation grew the editable region from 37.6% to 60.0% of the frame and left ~15% of it regenerated with no pixel conditioning, which cost identity around the jaw, neck, and hair.
 
@@ -287,14 +289,15 @@ python train.py experiment=viton-pft-xl-smoke16gb \
 
 `checkpoint_params.save_top_k` controls checkpoint retention. Its default value of `1` keeps only the newest numbered checkpoint, with `checkpoints/last.ckpt` pointing to it.
 
-The 512-by-384 experiment encodes garments online with DINOv2-small at 448 by 336 alongside the VAE pyramid. **DINO is frozen** (`garment_encoder_trainable_blocks: 0`): with the VAE branches carrying appearance, its only job is semantic correspondence, which pretrained DINOv2 already does well, and fine-tuning 22M parameters on ~11.6k pairs is a forgetting risk. Freezing also returns its optimizer state, gradients, and activations to the `detail` branch, and makes garment features deterministic per image. Set `garment_encoder_trainable_blocks` above 0 to run the unfreezing ablation; `garment_encoder_lr` applies only in that case. Cached garment features and `VITONHD_DINO_DIR` are not used.
+The 512-by-384 experiment encodes garments online with the VAE pyramid. Three settings there are worth knowing about:
 
-Two settings there are worth knowing about:
-
-- **Batch size 8 with four-step accumulation** (global batch 32). The `detail` branch contributes 3072 garment keys per routed block instead of 768, so activation memory is higher than a DINO-only run, though freezing DINO gives some of that back. This is a conservative starting point — measure peak memory and raise it if there is headroom. If it does not fit, halve the batch and double the accumulation before changing the routing.
+- **Batch size 8 with four-step accumulation** (global batch 32). The `detail` branch contributes 3072 garment keys per routed block instead of 768, so activation memory is high. This is a conservative starting point — measure peak memory and raise it if there is headroom. If it does not fit, halve the batch and double the accumulation before changing the routing.
+- **`correspondence_scales: [coarse, middle]`.** Correspondence supervision needs the full attention matrix, which disables fused attention for the blocks it touches. Restricting it to the 768-key branches keeps that affordable; placement is a coarse-scale decision anyway. `correspondence_warmup_steps: 1000` ramps the losses in so attention is not pinned before the freshly initialised garment embedders produce anything worth pointing at.
 - **Timestep mixture.** 10% of examples force every editable token time to zero (garment forcing), 25% pin the time ceiling at `t=1` (`high_time_probability`, detail refinement), and the rest use the logit-normal truncated-Gaussian schedule. The LTG ceiling `sigma(loc+z)` cannot itself reach `t=1`, so without the high-time regime the interval above `t=0.9` receives about 0.25% of the training signal — the interval where logo and printed-text detail is written. With it, that rises to about 7.8%.
 
 `trainer.params.detail_loss_weight` (default `0.0`) adds an L1 penalty on first spatial differences of the predicted clean latent. Set it to about `0.05` to push high-frequency garment structure harder.
+
+The DINOv3 teacher is a gated Hugging Face repository, so `HF_TOKEN` must belong to an account with access. To train without it, set `trainer.params.correspondence_center_weight=0` and `trainer.params.correspondence_entropy_weight=0`; the teacher is then never constructed. While it is on, watch `train/correspondence_coverage` — the fraction of editable tokens the teacher was confident enough to supervise. If it collapses toward zero, `correspondence_min_similarity` (default `0.35`) is too aggressive and the loss is silently doing nothing.
 
 See [`docs/VTON_PFT_DESIGN.md`](docs/VTON_PFT_DESIGN.md) sections 3.1, 6.3, and 10 for the measurements behind these choices.
 
