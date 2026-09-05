@@ -80,7 +80,9 @@ class VTONPatchForcingBlock(nn.Module):
                 garment_values,
                 key_padding_mask=garment_padding_mask,
                 need_weights=return_attention,
-                average_attn_weights=True,
+                # Keep heads separate for CORAL. Averaging here allowed a handful of
+                # correctly routed heads to hide the majority attending elsewhere.
+                average_attn_weights=False,
             )
             if edit_token_mask is not None:
                 cross = cross * edit_token_mask[..., None].to(cross.dtype)

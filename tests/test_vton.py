@@ -237,14 +237,81 @@ class VTONTests(unittest.TestCase):
                     # Clamped, never past 1.
                     self.assertEqual(trainer._correspondence_ramp(), 1.0)
 
-        # A real Lightning Trainer's counter wins once it is actually advancing.
+        # A synthetic Accelerate global step may jump to a loaded checkpoint step, but
+        # without a real Lightning Trainer the restart-local counter must still win.
         with patch.object(LatentVTONPatchForcingTrainer, "global_step", property(lambda self: 3)):
             trainer._optimizer_steps = 0
+            self.assertEqual(trainer._correspondence_ramp(), 0.0)
+            # A genuinely attached Lightning Trainer uses its own advancing counter.
+            trainer._trainer = object()
             self.assertEqual(trainer._correspondence_ramp(), 0.75)
+            trainer._trainer = None
 
         # Zero warmup short-circuits before any counter is consulted.
         trainer.correspondence_warmup_steps = 0
         self.assertEqual(trainer._correspondence_ramp(), 1.0)
+
+    def test_pure_noise_detection_ignores_non_editable_timestep_ones(self):
+        edit = torch.tensor([[True, True, False], [True, True, False], [False, False, False]])
+        times = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.2, 1.0], [1.0, 1.0, 1.0]])
+        pure = LatentVTONPatchForcingTrainer._pure_noise_samples(times, edit)
+        torch.testing.assert_close(pure, torch.tensor([True, False, False]))
+
+    def test_detail_importance_emphasises_sparse_edges_up_to_six_times(self):
+        target = torch.zeros(1, 4, 4, 5)
+        target[:, :, :, 3:] = 2.0
+        mask = torch.ones(1, 1, 4, 5)
+        importance = LatentVTONPatchForcingTrainer._detail_importance(
+            target, mask, edge_weight=5.0
+        )
+        self.assertEqual(tuple(importance.shape), (1, 1, 4, 5))
+        self.assertAlmostEqual(importance.min().item(), 1.0, places=6)
+        self.assertAlmostEqual(importance.max().item(), 6.0, places=6)
+
+    def test_value_target_ema_stays_frozen_and_tracks_the_student(self):
+        source = torch.nn.Linear(3, 2)
+        target = torch.nn.Linear(3, 2)
+        target.load_state_dict(source.state_dict())
+        target.requires_grad_(False)
+        before = target.weight.detach().clone()
+        with torch.no_grad():
+            source.weight.add_(2.0)
+        LatentVTONPatchForcingTrainer._ema_module(target, source, decay=0.75)
+        torch.testing.assert_close(target.weight, before + 0.5)
+        self.assertFalse(any(parameter.requires_grad for parameter in target.parameters()))
+
+    def test_legacy_checkpoint_initialises_missing_value_targets_from_loaded_student(self):
+        def make_trainer():
+            return LatentVTONPatchForcingTrainer(
+                model=self._multiscale_model(),
+                first_stage=torch.nn.Identity(),
+                flow={
+                    "target": "patch_flow.flow_vton.VTONPatchFlowForcing",
+                    "params": {"patch_size": 2},
+                },
+                ema_rate=0.0,
+                compute_validation_metrics=False,
+                correspondence_center_weight=0.0,
+                correspondence_nll_weight=0.0,
+                correspondence_entropy_weight=0.0,
+                correspondence_photometric_weight=0.0,
+                correspondence_value_weight=0.1,
+                correspondence_scales=["coarse", "middle", "detail"],
+            )
+
+        old = make_trainer()
+        legacy = {
+            key: value for key, value in old.state_dict().items()
+            if not key.startswith(("value_target_embedders.", "value_target_norms."))
+        }
+        restored = make_trainer()
+        restored.load_state_dict(legacy, strict=True)
+        for scale, target_embedder in restored.value_target_embedders.items():
+            source = restored._value_source_embedder(scale)
+            for target_parameter, source_parameter in zip(
+                target_embedder.parameters(), source.parameters()
+            ):
+                torch.testing.assert_close(target_parameter, source_parameter)
 
     @staticmethod
     def _map(attention, grid, padding=None, scale="coarse", block=1):
@@ -319,6 +386,24 @@ class VTONTests(unittest.TestCase):
         _, metrics = loss_fn(self._map(attention, grid), target, torch.ones(1, 1))
         self.assertAlmostEqual(metrics["correspondence_target_mass"].item(), 0.3, places=5)
 
+    def test_nll_and_entropy_supervise_each_attention_head(self):
+        """A correct head must not hide another head that routes the logo elsewhere."""
+        grid = (1, 2)
+        target = grid_coordinates(grid)[0].view(1, 1, 2)
+        per_head = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]])
+        averaged = per_head.mean(dim=1)
+        loss_fn = CorrespondenceAttentionLoss(
+            center_weight=0.0,
+            entropy_weight=0.01,
+            nll_weight=1.0,
+            nll_radius=0.1,
+            photometric_weight=0.0,
+        )
+        strict, strict_metrics = loss_fn(self._map(per_head, grid), target, torch.ones(1, 1))
+        old_loophole, _ = loss_fn(self._map(averaged, grid), target, torch.ones(1, 1))
+        self.assertGreater(strict.item(), 5 * old_loophole.item())
+        self.assertAlmostEqual(strict_metrics["correspondence_target_mass"].item(), 0.5, places=6)
+
     def test_nll_radius_can_be_configured_per_garment_scale(self):
         grid = (1, 5)
         target = grid_coordinates(grid)[2].view(1, 1, 2)
@@ -387,9 +472,36 @@ class VTONTests(unittest.TestCase):
         correct, metrics = evaluate(value_target.clone())
         opposite, _ = evaluate(-value_target)
         self.assertAlmostEqual(correct.item(), 0.0, places=6)
-        self.assertGreater(opposite.item(), 1.9)
+        self.assertGreater(opposite.item(), 1.0)
         self.assertAlmostEqual(metrics["correspondence_value"].item(), 0.0, places=6)
+        self.assertAlmostEqual(metrics["correspondence_value_cosine"].item(), 0.0, places=6)
+        self.assertAlmostEqual(metrics["correspondence_value_huber"].item(), 0.0, places=6)
         self.assertIn("correspondence/middle/value", metrics)
+
+    def test_value_huber_rejects_the_cosine_scale_shortcut(self):
+        grid = (1, 1)
+        target = torch.ones(1, 1, 4)
+        maps = [{
+            "block": 1,
+            "scale": "coarse",
+            "weights": torch.ones(1, 1, 1),
+            "output": target * 0.01,
+            "grid": grid,
+            "key_padding": None,
+        }]
+        cosine_only = CorrespondenceAttentionLoss(
+            center_weight=0.0, entropy_weight=0.0, nll_weight=0.0,
+            photometric_weight=0.0, value_weight=1.0, value_cosine_mix=1.0,
+        )
+        mixed = CorrespondenceAttentionLoss(
+            center_weight=0.0, entropy_weight=0.0, nll_weight=0.0,
+            photometric_weight=0.0, value_weight=1.0, value_cosine_mix=0.5,
+        )
+        kwargs = dict(appearance_weight=torch.ones(1, 1), value_targets={"coarse": target})
+        self.assertAlmostEqual(cosine_only(maps, **kwargs)[0].item(), 0.0, places=6)
+        mixed_loss, metrics = mixed(maps, **kwargs)
+        self.assertGreater(mixed_loss.item(), 0.1)
+        self.assertGreater(metrics["correspondence_value_huber"].item(), 0.1)
 
     def test_photometric_loss_penalises_retrieving_the_garment_mean(self):
         """Exactly the observed defect: every person token retrieving the same average
@@ -788,9 +900,14 @@ class VTONTests(unittest.TestCase):
         self.assertEqual(routes.count("coarse"), 4)
         self.assertEqual(routes.count("middle"), 4)
         self.assertEqual(routes.count("detail"), 6)
-        self.assertEqual(config.trainer.params.correspondence_photometric_weight, 0.5)
-        self.assertEqual(config.trainer.params.correspondence_value_weight, 0.5)
-        self.assertEqual(config.trainer.params.detail_loss_weight, 0.1)
+        self.assertEqual(config.trainer.params.correspondence_nll_weight, 0.1)
+        self.assertEqual(config.trainer.params.correspondence_center_weight, 0.05)
+        self.assertEqual(config.trainer.params.correspondence_entropy_weight, 0.01)
+        self.assertEqual(config.trainer.params.correspondence_photometric_weight, 0.1)
+        self.assertEqual(config.trainer.params.correspondence_value_weight, 0.1)
+        self.assertEqual(config.trainer.params.detail_loss_weight, 0.5)
+        self.assertEqual(config.trainer.params.detail_edge_weight, 5.0)
+        self.assertTrue(config.trainer.params.detail_pure_noise_only)
 
     def test_routes_must_reference_enabled_branches(self):
         with self.assertRaises(ValueError):
@@ -873,10 +990,10 @@ class VTONTests(unittest.TestCase):
         for entry in maps:
             height, width = entry["grid"]
             # Queries are always the person token grid; keys follow the branch's own grid.
-            self.assertEqual(tuple(entry["weights"].shape), (1, 12, height * width))
+            self.assertEqual(tuple(entry["weights"].shape), (1, 4, 12, height * width))
             self.assertEqual(tuple(entry["output"].shape), (1, 12, model.hidden_size))
             torch.testing.assert_close(
-                entry["weights"].sum(-1), torch.ones(1, 12), atol=1e-5, rtol=1e-5
+                entry["weights"].sum(-1), torch.ones(1, 4, 12), atol=1e-5, rtol=1e-5
             )
 
         with torch.no_grad():
@@ -1015,7 +1132,8 @@ class VTONTests(unittest.TestCase):
         final_loss, final_attention = step()
         self.assertLess(final_loss.item(), first_loss.item())
         self.assertGreater(
-            final_attention[0, :, matched].mean().item(), first_attention[0, :, matched].mean().item()
+            final_attention[0, :, :, matched].mean().item(),
+            first_attention[0, :, :, matched].mean().item(),
         )
 
     def test_edit_mask_is_not_grown_past_the_token_grid(self):

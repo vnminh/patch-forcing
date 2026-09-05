@@ -1,6 +1,8 @@
 import os
+from copy import deepcopy
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.utils import save_image
 
@@ -21,6 +23,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         uncertainty_weight=0.01,
         outside_velocity_weight=0.01,
         detail_loss_weight=0.0,
+        detail_edge_weight=5.0,
+        detail_pure_noise_only=True,
         garment_dropout_prob=0.1,
         correspondence_center_weight=0.25,
         correspondence_entropy_weight=0.05,
@@ -28,6 +32,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         correspondence_nll_radius=0.05,
         correspondence_photometric_weight=1.0,
         correspondence_value_weight=0.0,
+        correspondence_value_cosine_mix=0.5,
+        correspondence_value_target_ema=0.999,
         correspondence_teacher_name="facebook/dinov3-vits16-pretrain-lvd1689m",
         correspondence_teacher_input_size=(512, 384),
         correspondence_garment_grid=None,
@@ -48,6 +54,10 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         self.uncertainty_weight = float(uncertainty_weight)
         self.outside_velocity_weight = float(outside_velocity_weight)
         self.detail_loss_weight = float(detail_loss_weight)
+        self.detail_edge_weight = float(detail_edge_weight)
+        self.detail_pure_noise_only = bool(detail_pure_noise_only)
+        if self.detail_edge_weight < 0:
+            raise ValueError("detail_edge_weight must be non-negative")
         self.garment_dropout_prob = float(garment_dropout_prob)
         self.use_vae_garment = bool(getattr(self.model, "use_vae_garment", False))
         self.use_multiscale_garment = bool(getattr(self.model, "use_multiscale_garment", False))
@@ -64,12 +74,34 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             nll_radius=correspondence_nll_radius,
             photometric_weight=correspondence_photometric_weight,
             value_weight=correspondence_value_weight,
+            value_cosine_mix=correspondence_value_cosine_mix,
         )
         self.correspondence_min_similarity = float(correspondence_min_similarity)
         self.correspondence_soft_target_temperature = float(correspondence_soft_target_temperature)
         self.correspondence_mutual = bool(correspondence_mutual)
         self.correspondence_weight_by_similarity = bool(correspondence_weight_by_similarity)
         self.correspondence_scales = None if correspondence_scales is None else list(correspondence_scales)
+        self.correspondence_value_target_ema = float(correspondence_value_target_ema)
+        if not 0 <= self.correspondence_value_target_ema < 1:
+            raise ValueError("correspondence_value_target_ema must be in [0, 1)")
+        self.value_target_embedders = nn.ModuleDict()
+        self.value_target_norms = nn.ModuleDict()
+        if self.correspondence_loss.value_weight > 0:
+            configured_scales = set(
+                self.correspondence_scales
+                if self.correspondence_scales is not None
+                else self.model._enabled_scales()
+            )
+            for scale in self.model._enabled_scales():
+                if scale not in configured_scales:
+                    continue
+                self.value_target_embedders[scale] = deepcopy(self._value_source_embedder(scale))
+                source_norm = self._value_source_norm(scale)
+                self.value_target_norms[scale] = (
+                    nn.Identity() if source_norm is None else deepcopy(source_norm)
+                )
+            self.value_target_embedders.requires_grad_(False)
+            self.value_target_norms.requires_grad_(False)
         self.correspondence_warmup_steps = int(correspondence_warmup_steps)
         if self.correspondence_warmup_steps < 0:
             raise ValueError("correspondence_warmup_steps must be non-negative")
@@ -258,12 +290,14 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
     def _training_step_count(self):
         """Optimizer steps taken so far.
 
-        Prefers Lightning's counter when a real Trainer drives training, and falls back to
-        the local one under the accelerate loop, where Lightning's is absent or stuck at 0.
+        Uses Lightning's counter only when a real Trainer is attached. ``train.py`` adds
+        a synthetic ``global_step`` that jumps to the checkpoint step after its first
+        update; using it made a requested 1000-step restart warmup last only one batch.
         """
-        step = getattr(self, "global_step", None)
-        if isinstance(step, int) and step > 0:
-            return step
+        if getattr(self, "_trainer", None) is not None:
+            step = getattr(self, "global_step", None)
+            if isinstance(step, int) and step > 0:
+                return step
         return self._optimizer_steps
 
     def _correspondence_ramp(self):
@@ -271,8 +305,74 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             return 1.0
         return min(1.0, self._training_step_count() / self.correspondence_warmup_steps)
 
+    def _value_source_embedder(self, scale):
+        if scale == "coarse":
+            return self.model.garment_embedder
+        return getattr(self.model, f"garment_{scale}_embedder")
+
+    def _value_source_norm(self, scale):
+        if self.model.garment_token_norms is None:
+            return None
+        return self.model.garment_token_norms[scale]
+
+    @staticmethod
+    @torch.no_grad()
+    def _ema_module(target, source, decay):
+        target_parameters = dict(target.named_parameters())
+        source_parameters = dict(source.named_parameters())
+        if target_parameters.keys() != source_parameters.keys():
+            raise RuntimeError("EMA value target and source projector parameters do not match")
+        for name, target_parameter in target_parameters.items():
+            target_parameter.mul_(decay).add_(source_parameters[name], alpha=1 - decay)
+        target_buffers = dict(target.named_buffers())
+        source_buffers = dict(source.named_buffers())
+        if target_buffers.keys() != source_buffers.keys():
+            raise RuntimeError("EMA value target and source projector buffers do not match")
+        for name, target_buffer in target_buffers.items():
+            if target_buffer.is_floating_point():
+                target_buffer.mul_(decay).add_(source_buffers[name], alpha=1 - decay)
+            else:
+                target_buffer.copy_(source_buffers[name])
+
+    @torch.no_grad()
+    def _update_value_target_projectors(self, decay=None):
+        if not hasattr(self, "value_target_embedders"):
+            return
+        decay = self.correspondence_value_target_ema if decay is None else float(decay)
+        for scale, target_embedder in self.value_target_embedders.items():
+            self._ema_module(target_embedder, self._value_source_embedder(scale), decay)
+            source_norm = self._value_source_norm(scale)
+            if source_norm is not None:
+                self._ema_module(self.value_target_norms[scale], source_norm, decay)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Load legacy checkpoints and initialise their missing EMA value targets."""
+        target_prefixes = ("value_target_embedders.", "value_target_norms.")
+        try:
+            incompatible = super().load_state_dict(state_dict, strict=False, assign=assign)
+        except TypeError:  # PyTorch versions before the ``assign`` argument.
+            incompatible = super().load_state_dict(state_dict, strict=False)
+        missing_targets = [
+            key for key in incompatible.missing_keys if key.startswith(target_prefixes)
+        ]
+        missing = [key for key in incompatible.missing_keys if key not in missing_targets]
+        unexpected = list(incompatible.unexpected_keys)
+        if strict and (missing or unexpected):
+            details = []
+            if missing:
+                details.append(f"Missing key(s): {missing}")
+            if unexpected:
+                details.append(f"Unexpected key(s): {unexpected}")
+            raise RuntimeError("Error(s) in loading state_dict: " + "; ".join(details))
+        if self.value_target_embedders and missing_targets:
+            # This runs after the student was loaded, so an old checkpoint starts with a
+            # genuinely frozen copy of its learned projectors, not constructor weights.
+            self._update_value_target_projectors(decay=0.0)
+        return type(incompatible)(missing, unexpected)
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         super().on_train_batch_end(outputs, batch, batch_idx)
+        self._update_value_target_projectors()
         self._optimizer_steps += 1
 
     @torch.no_grad()
@@ -336,31 +436,53 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         )
         targets = {}
         if "coarse" in configured:
-            if self.model.garment_embedder is None:
+            if "coarse" not in self.value_target_embedders:
                 raise ValueError("Coarse value supervision requires the coarse garment embedder")
-            tokens = self.model.garment_embedder(encoded["target"])
-            targets["coarse"] = self.model._normalize_garment_tokens("coarse", tokens).detach()
+            tokens = self.value_target_embedders["coarse"](encoded["target"])
+            targets["coarse"] = self.value_target_norms["coarse"](tokens)
 
         for scale in ("middle", "detail"):
             if scale not in configured:
                 continue
             source = encoded[f"target_{scale}"]
-            embedder = getattr(self.model, f"garment_{scale}_embedder")
-            if source is None or embedder is None:
+            if source is None or scale not in self.value_target_embedders:
                 raise ValueError(f"{scale.capitalize()} value supervision requires target SD-VAE features")
-            embedded = embedder(source)
+            embedded = self.value_target_embedders[scale](source)
             if embedded.shape[-2:] != query_grid:
                 embedded = F.adaptive_avg_pool2d(embedded, query_grid)
             tokens = embedded.flatten(2).transpose(1, 2)
-            targets[scale] = self.model._normalize_garment_tokens(scale, tokens).detach()
+            targets[scale] = self.value_target_norms[scale](tokens)
         return targets
 
     @staticmethod
-    def _detail_loss(predicted, target, mask):
+    def _detail_importance(target, mask, edge_weight=5.0):
+        """Weight sparse latent edges (logos, text and seams) up to 6x by default."""
+        horizontal = (target[:, :, :, 1:] - target[:, :, :, :-1]).abs().mean(1, keepdim=True)
+        vertical = (target[:, :, 1:, :] - target[:, :, :-1, :]).abs().mean(1, keepdim=True)
+        edge = F.pad(horizontal, (0, 1, 0, 0)) + F.pad(vertical, (0, 0, 0, 1))
+        edge = edge.detach() * mask
+        mean_edge = edge.sum((2, 3), keepdim=True) / mask.sum((2, 3), keepdim=True).clamp_min(1.0)
+        strength = (edge / mean_edge.clamp_min(1e-6)).clamp(0, 1)
+        return 1.0 + float(edge_weight) * strength
+
+    @staticmethod
+    def _pure_noise_samples(timesteps, edit_tokens):
+        """Samples whose entire editable region is at t=0; outside tokens are t=1."""
+        return ((timesteps == 0) | ~edit_tokens).all(dim=1) & edit_tokens.any(dim=1)
+
+    @staticmethod
+    def _detail_loss(predicted, target, mask, importance=None):
         """L1 on first spatial differences: penalises washed-out high-frequency structure
         (logo edges, printed text, colour-block seams) that a plain MSE tolerates."""
         horizontal_mask = mask[:, :, :, 1:] * mask[:, :, :, :-1]
         vertical_mask = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+        if importance is not None:
+            horizontal_mask = horizontal_mask * 0.5 * (
+                importance[:, :, :, 1:] + importance[:, :, :, :-1]
+            )
+            vertical_mask = vertical_mask * 0.5 * (
+                importance[:, :, 1:, :] + importance[:, :, :-1, :]
+            )
         horizontal = (predicted[:, :, :, 1:] - predicted[:, :, :, :-1]) - (
             target[:, :, :, 1:] - target[:, :, :, :-1]
         )
@@ -427,9 +549,26 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 timesteps, target.shape[-2], target.shape[-1], target.dtype
             )
             predicted_clean = xt + (1 - time_latent) * velocity
-            detail_loss = self._detail_loss(predicted_clean, target, masks.latent)
+            pure_noise_sample = self._pure_noise_samples(timesteps, masks.token)
+            detail_supervised_sample = torch.ones_like(pure_noise_sample)
+            if self.detail_pure_noise_only:
+                detail_supervised_sample = detail_supervised_sample & pure_noise_sample
+            if keep is not None:
+                # A classifier-free dropped garment cannot explain its target logo.
+                detail_supervised_sample = detail_supervised_sample & keep.bool()
+            detail_mask = masks.latent * detail_supervised_sample[:, None, None, None].to(
+                masks.latent.dtype
+            )
+            detail_importance = self._detail_importance(
+                target, masks.latent, edge_weight=self.detail_edge_weight
+            )
+            detail_loss = self._detail_loss(
+                predicted_clean, target, detail_mask, importance=detail_importance
+            )
             loss = loss + self.detail_loss_weight * detail_loss
             metrics["detail_loss"] = detail_loss
+            metrics["detail_active_fraction"] = detail_supervised_sample.float().mean()
+            metrics["detail_edge_importance"] = masked_mean(detail_importance, masks.latent)
         if attention_maps:
             appearance, appearance_weight = self._appearance_targets(batch, encoded, masks.token, keep)
             value_targets = (

@@ -43,11 +43,20 @@ trainer:
       coarse: 0.04
       middle: 0.03
       detail: 0.025
-    # Geometry is already reliable; emphasise what V/out_proj transports and reduce the
-    # RGB routing term, which can reward colour blends instead of exact printed content.
-    correspondence_photometric_weight: 0.5
-    correspondence_value_weight: 0.5
-    detail_loss_weight: 0.1
+    # Balanced auxiliary losses. NLL/centre/entropy now supervise every head separately;
+    # value aligns both direction and magnitude to a slowly moving EMA target.
+    correspondence_nll_weight: 0.1
+    correspondence_center_weight: 0.05
+    correspondence_entropy_weight: 0.01
+    correspondence_photometric_weight: 0.1
+    correspondence_value_weight: 0.1
+    correspondence_value_cosine_mix: 0.5
+    correspondence_value_target_ema: 0.999
+    # High-frequency target-latent edges receive 1+5=6x weight. Apply only to the 35%
+    # pure-noise garment-forcing samples so this term teaches true garment reconstruction.
+    detail_loss_weight: 0.5
+    detail_edge_weight: 5.0
+    detail_pure_noise_only: true
     correspondence_warmup_steps: 1000
     sample_kwargs:
       num_steps: 30

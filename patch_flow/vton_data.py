@@ -4,6 +4,7 @@ import random
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
 
@@ -50,6 +51,10 @@ class VTONHDDataset(Dataset):
         pair_list=None,
         image_size=256,
         random_flip=False,
+        random_shift_scale=False,
+        shift_scale_prob=0.5,
+        shift_limit=0.2,
+        scale_limit=0.2,
         paired=True,
         preview_sample_id=None,
     ):
@@ -57,6 +62,16 @@ class VTONHDDataset(Dataset):
         self.split = split
         self.image_size = _image_size(image_size)
         self.random_flip = bool(random_flip)
+        self.random_shift_scale = bool(random_shift_scale)
+        self.shift_scale_prob = float(shift_scale_prob)
+        self.shift_limit = float(shift_limit)
+        self.scale_limit = float(scale_limit)
+        if not 0.0 <= self.shift_scale_prob <= 1.0:
+            raise ValueError("shift_scale_prob must be in [0, 1]")
+        if not 0.0 <= self.shift_limit <= 1.0:
+            raise ValueError("shift_limit must be in [0, 1]")
+        if not 0.0 <= self.scale_limit < 1.0:
+            raise ValueError("scale_limit must be in [0, 1)")
         self.paired = bool(paired)
         split_root = os.path.join(self.root, split)
         self.image_dir = os.path.join(split_root, "image")
@@ -91,6 +106,45 @@ class VTONHDDataset(Dataset):
         image = Image.open(path).convert("L")
         return _letterbox(image, self.image_size, 0, Image.Resampling.NEAREST)
 
+    def _sample_shift_scale(self):
+        if not self.random_shift_scale or random.random() >= self.shift_scale_prob:
+            return None
+        height, width = self.image_size
+        translate = [
+            round(random.uniform(-self.shift_limit, self.shift_limit) * width),
+            round(random.uniform(-self.shift_limit, self.shift_limit) * height),
+        ]
+        scale = random.uniform(1.0 - self.scale_limit, 1.0 + self.scale_limit)
+        return translate, scale
+
+    @staticmethod
+    def _apply_shift_scale(image, mask, params):
+        if params is None:
+            return image, mask
+        translate, scale = params
+        # The RGB image and its mask share one transform, while person and garment
+        # receive independently sampled transforms. This is the StableVITON setup
+        # that prevents correspondence from collapsing to absolute coordinates.
+        image = TF.affine(
+            image,
+            angle=0.0,
+            translate=translate,
+            scale=scale,
+            shear=[0.0, 0.0],
+            interpolation=InterpolationMode.BICUBIC,
+            fill=[0, 0, 0],
+        )
+        mask = TF.affine(
+            mask,
+            angle=0.0,
+            translate=translate,
+            scale=scale,
+            shear=[0.0, 0.0],
+            interpolation=InterpolationMode.NEAREST,
+            fill=0,
+        )
+        return image, mask
+
     def __getitem__(self, index):
         person_name, garment_name = self.pairs[index]
         if self.paired:
@@ -105,6 +159,13 @@ class VTONHDDataset(Dataset):
             garment = TF.hflip(garment)
             agnostic_mask = TF.hflip(agnostic_mask)
             garment_mask = TF.hflip(garment_mask)
+
+        person, agnostic_mask = self._apply_shift_scale(
+            person, agnostic_mask, self._sample_shift_scale()
+        )
+        garment, garment_mask = self._apply_shift_scale(
+            garment, garment_mask, self._sample_shift_scale()
+        )
 
         person = TF.to_tensor(person) * 2 - 1
         garment = TF.to_tensor(garment) * 2 - 1

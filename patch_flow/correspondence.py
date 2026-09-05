@@ -271,6 +271,7 @@ class CorrespondenceAttentionLoss(nn.Module):
         nll_radius=0.05,
         photometric_weight=1.0,
         value_weight=0.0,
+        value_cosine_mix=0.5,
         entropy_eps=1e-8,
     ):
         super().__init__()
@@ -285,9 +286,12 @@ class CorrespondenceAttentionLoss(nn.Module):
             self.nll_radius = float(nll_radius)
         self.photometric_weight = float(photometric_weight)
         self.value_weight = float(value_weight)
+        self.value_cosine_mix = float(value_cosine_mix)
         self.entropy_eps = float(entropy_eps)
         if self.value_weight < 0:
             raise ValueError("value_weight must be non-negative")
+        if not 0.0 <= self.value_cosine_mix <= 1.0:
+            raise ValueError("value_cosine_mix must be in [0, 1]")
         radii = self.nll_radius.values() if isinstance(self.nll_radius, dict) else (self.nll_radius,)
         if any(not 0 < radius < 1 for radius in radii):
             raise ValueError("nll_radius values are in normalised garment units and must be in (0, 1)")
@@ -360,12 +364,17 @@ class CorrespondenceAttentionLoss(nn.Module):
             "nll": zero,
             "photometric": zero,
             "value": zero,
+            "value_cosine": zero,
+            "value_huber": zero,
             "mass": zero,
         }
         scale_totals = {}
         metrics = {}
         for entry in attention_maps:
-            attention = entry["weights"].float()
+            # Keep the full per-head map in its autocast dtype. At 512x384 a detail map
+            # is (B,16,768,3072); eagerly copying every block to fp32 costs >1 GiB on a
+            # 24-GiB GPU. Reductions below promote only their compact outputs to fp32.
+            attention = entry["weights"]
             grid = entry["grid"]
             scale = entry["scale"]
             prefix = f"correspondence/block_{entry['block']:02d}_{scale}"
@@ -376,6 +385,8 @@ class CorrespondenceAttentionLoss(nn.Module):
                     "nll": zero,
                     "photometric": zero,
                     "value": zero,
+                    "value_cosine": zero,
+                    "value_huber": zero,
                     "mass": zero,
                     "count": 0,
                 }
@@ -385,56 +396,88 @@ class CorrespondenceAttentionLoss(nn.Module):
                 raise ValueError(
                     f"Branch '{entry['scale']}' has {attention.shape[-1]} keys but grid {grid}"
                 )
+            if attention.ndim == 3:
+                # Backward compatibility for external callers and old unit fixtures.
+                attention_heads = attention[:, None]
+            elif attention.ndim == 4:
+                attention_heads = attention
+            else:
+                raise ValueError(
+                    "Garment attention must have shape (B,Q,K) or (B,H,Q,K), got "
+                    f"{tuple(attention.shape)}"
+                )
+            heads = attention_heads.shape[1]
 
             if use_target:
-                if attention.shape[1] != target.shape[1]:
+                if attention_heads.shape[-2] != target.shape[1]:
                     raise ValueError(
-                        f"Attention has {attention.shape[1]} queries but the correspondence target has "
+                        f"Attention has {attention_heads.shape[-2]} queries but the correspondence target has "
                         f"{target.shape[1]}; the query grid must be the person token grid"
                     )
-                denominator = weight.sum().clamp_min(1e-6)
-                center = attention @ coordinates
-                center_loss = ((center - target).square().sum(-1) * weight).sum() / denominator
+                target_heads = target[:, None].expand(-1, heads, -1, -1)
+                weight_heads = weight[:, None].expand(-1, heads, -1)
+                denominator = weight_heads.sum().clamp_min(1e-6)
+                center = attention_heads @ coordinates
+                center = center.float()
+                center_loss = (
+                    (center - target_heads).square().sum(-1) * weight_heads
+                ).sum() / denominator
                 radius = self._nll_radius_for_scale(scale)
-                mass = neighbourhood_mass(attention, target, grid, radius)
-                nll_loss = (-torch.log(mass.clamp_min(1e-6)) * weight).sum() / denominator
+                mass = neighbourhood_mass(attention_heads, target_heads, grid, radius)
+                mass = mass.float()
+                # Mean of per-head NLL, not NLL of the mean attention. The latter is
+                # satisfied by a few good heads and was the measured logo-routing loophole.
+                nll_loss = (
+                    -torch.log(mass.clamp_min(1e-6)) * weight_heads
+                ).sum() / denominator
                 totals["center"] = totals["center"] + center_loss
                 totals["nll"] = totals["nll"] + nll_loss
-                totals["mass"] = totals["mass"] + (mass * weight).sum() / denominator
+                totals["mass"] = totals["mass"] + (mass * weight_heads).sum() / denominator
                 scale_totals[scale]["center"] = scale_totals[scale]["center"] + center_loss
                 scale_totals[scale]["nll"] = scale_totals[scale]["nll"] + nll_loss
                 scale_totals[scale]["mass"] = (
-                    scale_totals[scale]["mass"] + (mass * weight).sum() / denominator
+                    scale_totals[scale]["mass"] + (mass * weight_heads).sum() / denominator
                 )
                 metrics[f"{prefix}/center"] = center_loss.detach()
                 metrics[f"{prefix}/nll"] = nll_loss.detach()
-                metrics[f"{prefix}/target_mass"] = ((mass * weight).sum() / denominator).detach()
+                metrics[f"{prefix}/target_mass"] = (
+                    (mass * weight_heads).sum() / denominator
+                ).detach()
 
             if self.entropy_weight > 0 and spread_weight is not None:
-                spread_denominator = spread_weight.sum().clamp_min(1e-6)
-                entropy = -(attention * torch.log(attention.clamp_min(self.entropy_eps))).sum(-1)
+                spread_heads = spread_weight[:, None].expand(-1, heads, -1)
+                spread_denominator = spread_heads.sum().clamp_min(1e-6)
+                # One differentiable x*log(x) op avoids retaining a second full per-head
+                # log tensor for backward. ``entr(0) == 0`` is also exact.
+                entropy = torch.special.entr(attention_heads).sum(-1).float()
                 padding = entry.get("key_padding")
                 keys = (
-                    torch.full((attention.shape[0], 1), float(attention.shape[-1]), device=device)
-                    if padding is None
-                    else (~padding).sum(-1, keepdim=True).float()
+                    torch.full(
+                        (attention_heads.shape[0], 1, 1),
+                        float(attention_heads.shape[-1]),
+                        device=device,
+                    )
+                    if padding is None else (~padding).sum(-1).float()[:, None, None]
                 )
                 # Normalise by the entropy of the uniform distribution over usable keys so the
                 # 3072-key detail branch and the 768-key coarse branch contribute comparably.
                 entropy = entropy / torch.log(keys.clamp_min(2.0))
-                entropy_loss = (entropy * spread_weight).sum() / spread_denominator
+                entropy_loss = (entropy * spread_heads).sum() / spread_denominator
                 totals["entropy"] = totals["entropy"] + entropy_loss
                 scale_totals[scale]["entropy"] = scale_totals[scale]["entropy"] + entropy_loss
                 metrics[f"{prefix}/entropy"] = entropy_loss.detach()
 
             if use_photometric:
+                # Colour routing remains a property of the ensemble of heads. Geometry
+                # and confidence above are intentionally strict per head.
+                routing_attention = attention_heads.mean(dim=1).float()
                 photometric_denominator = appearance_weight.sum().clamp_min(1e-6)
                 keys_appearance = (
                     F.adaptive_avg_pool2d(appearance["garment"].float(), (int(grid[0]), int(grid[1])))
                     .flatten(2)
                     .transpose(1, 2)
                 )
-                retrieved = attention @ keys_appearance
+                retrieved = routing_attention @ keys_appearance
                 error = (retrieved - appearance["query"].float()).square().sum(-1)
                 photometric_loss = (error * appearance_weight).sum() / photometric_denominator
                 totals["photometric"] = totals["photometric"] + photometric_loss
@@ -460,16 +503,31 @@ class CorrespondenceAttentionLoss(nn.Module):
                         f"Transported value shape {tuple(transported.shape)} does not match "
                         f"the '{scale}' target shape {tuple(value_target.shape)}"
                     )
-                # Direction, rather than magnitude, is supervised: the cross-attention
-                # residual has a backbone-dependent scale, while both tensors share the
-                # same SD-VAE/embedder feature basis. Unlike RGB routing, this term goes
-                # through the real V projection and output projection.
-                value_error = 1 - F.cosine_similarity(transported, value_target, dim=-1)
+                cosine_error = 1 - F.cosine_similarity(transported, value_target, dim=-1)
+                huber_error = F.smooth_l1_loss(
+                    transported, value_target, reduction="none"
+                ).mean(-1)
+                value_error = (
+                    self.value_cosine_mix * cosine_error
+                    + (1.0 - self.value_cosine_mix) * huber_error
+                )
                 value_denominator = appearance_weight.sum().clamp_min(1e-6)
                 value_loss = (value_error * appearance_weight).sum() / value_denominator
+                value_cosine = (cosine_error * appearance_weight).sum() / value_denominator
+                value_huber = (huber_error * appearance_weight).sum() / value_denominator
                 totals["value"] = totals["value"] + value_loss
+                totals["value_cosine"] = totals["value_cosine"] + value_cosine
+                totals["value_huber"] = totals["value_huber"] + value_huber
                 scale_totals[scale]["value"] = scale_totals[scale]["value"] + value_loss
+                scale_totals[scale]["value_cosine"] = (
+                    scale_totals[scale]["value_cosine"] + value_cosine
+                )
+                scale_totals[scale]["value_huber"] = (
+                    scale_totals[scale]["value_huber"] + value_huber
+                )
                 metrics[f"{prefix}/value"] = value_loss.detach()
+                metrics[f"{prefix}/value_cosine"] = value_cosine.detach()
+                metrics[f"{prefix}/value_huber"] = value_huber.detach()
 
         count = len(attention_maps)
         for key in totals:
@@ -482,6 +540,8 @@ class CorrespondenceAttentionLoss(nn.Module):
             metrics[f"correspondence/{scale}/entropy"] = averaged["entropy"].detach()
             metrics[f"correspondence/{scale}/photometric"] = averaged["photometric"].detach()
             metrics[f"correspondence/{scale}/value"] = averaged["value"].detach()
+            metrics[f"correspondence/{scale}/value_cosine"] = averaged["value_cosine"].detach()
+            metrics[f"correspondence/{scale}/value_huber"] = averaged["value_huber"].detach()
             metrics[f"correspondence/{scale}/target_mass"] = averaged["mass"].detach()
             metrics[f"correspondence/{scale}/appearance_error"] = (
                 averaged["photometric"].detach().clamp_min(0).sqrt()
@@ -498,6 +558,8 @@ class CorrespondenceAttentionLoss(nn.Module):
         metrics["correspondence_entropy"] = totals["entropy"].detach()
         metrics["correspondence_photometric"] = totals["photometric"].detach()
         metrics["correspondence_value"] = totals["value"].detach()
+        metrics["correspondence_value_cosine"] = totals["value_cosine"].detach()
+        metrics["correspondence_value_huber"] = totals["value_huber"].detach()
         # Directly interpretable: mass actually landing on the target, and the retrieved
         # appearance error in the same RGB units the diagnostics report.
         metrics["correspondence_target_mass"] = totals["mass"].detach()

@@ -261,7 +261,10 @@ def aggregate_student_maps(attention_maps):
     by_scale = defaultdict(list)
     grids = {}
     for entry in attention_maps:
-        by_scale[entry["scale"]].append(entry["weights"].float())
+        weights = entry["weights"].float()
+        if weights.ndim == 4:
+            weights = weights.mean(dim=1)
+        by_scale[entry["scale"]].append(weights)
         grids[entry["scale"]] = tuple(entry["grid"])
     return {scale: torch.stack(values).mean(0) for scale, values in by_scale.items()}, grids
 
