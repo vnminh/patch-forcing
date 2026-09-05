@@ -58,6 +58,7 @@ class VTONPatchForcingBlock(nn.Module):
         x,
         c,
         garment_tokens=None,
+        garment_values=None,
         garment_padding_mask=None,
         edit_token_mask=None,
         return_attention=False,
@@ -66,12 +67,17 @@ class VTONPatchForcingBlock(nn.Module):
         x = x + gate_msa * self.attn(pf_modulate(self.norm1(x), shift_msa, scale_msa))
         attention = None
         if self.use_garment_cross_attention and garment_tokens is not None:
+            # Position belongs in K, where it helps routing, but not in V: transporting
+            # source coordinates together with garment appearance conflicts with the
+            # content-only target used by the value loss and weakens logos/text.
+            if garment_values is None:
+                garment_values = garment_tokens
             # need_weights forces the unfused attention path, so it is requested only for
             # the blocks the correspondence loss actually supervises.
             cross, attention = self.garment_cross_attention(
                 self.garment_norm(x),
                 garment_tokens,
-                garment_tokens,
+                garment_values,
                 key_padding_mask=garment_padding_mask,
                 need_weights=return_attention,
                 average_attn_weights=True,
@@ -344,14 +350,16 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         return self.garment_token_norms[scale](tokens)
 
     def _garment_branches(self, garment, garment_middle, garment_detail, x, position, height, width):
-        tokens = {}
+        keys = {}
+        values = {}
         grids = {}
         token_height = height // self.patch_size
         token_width = width // self.patch_size
 
         if garment is not None and self.garment_embedder is not None:
             latent = F.interpolate(garment, size=(height, width), mode="bilinear", align_corners=False)
-            tokens["coarse"] = self._normalize_garment_tokens("coarse", self.garment_embedder(latent)) + position
+            values["coarse"] = self._normalize_garment_tokens("coarse", self.garment_embedder(latent))
+            keys["coarse"] = values["coarse"] + position
             grids["coarse"] = (token_height, token_width)
 
         for name, source, embedder in (
@@ -365,9 +373,10 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             embedded = embedder(source)
             grid = (embedded.shape[-2], embedded.shape[-1])
             embedded = self._normalize_garment_tokens(name, embedded.flatten(2).transpose(1, 2))
-            tokens[name] = embedded.to(x.dtype) + self._grid_position_embedding(*grid, x.dtype, x.device)
+            values[name] = embedded.to(x.dtype)
+            keys[name] = values[name] + self._grid_position_embedding(*grid, x.dtype, x.device)
             grids[name] = grid
-        return tokens, grids
+        return keys, values, grids
 
     def _garment_padding_masks(self, garment_mask, grids):
         padding = {}
@@ -422,7 +431,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 y = torch.full((batch,), self.y_embedder.num_classes, device=x.device, dtype=torch.long)
             cond = cond + self.y_embedder(y, self.training)[:, None, :]
 
-        garment_tokens, garment_grids = self._garment_branches(
+        garment_tokens, garment_values, garment_grids = self._garment_branches(
             garment, garment_middle, garment_detail, x, position, height, width
         )
         garment_padding_masks = self._garment_padding_masks(garment_mask, garment_grids)
@@ -433,6 +442,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         attention_maps = []
         for index, block in enumerate(self.blocks, start=1):
             block_tokens = garment_tokens.get(block.garment_scale)
+            block_values = garment_values.get(block.garment_scale)
             block_padding_mask = garment_padding_masks.get(block.garment_scale)
             want_attention = (
                 return_garment_attention
@@ -445,13 +455,22 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                     x,
                     cond,
                     block_tokens,
+                    block_values,
                     block_padding_mask,
                     edit_token_mask,
                     want_attention,
                     use_reentrant=False,
                 )
             else:
-                output = block(x, cond, block_tokens, block_padding_mask, edit_token_mask, want_attention)
+                output = block(
+                    x,
+                    cond,
+                    block_tokens,
+                    block_values,
+                    block_padding_mask,
+                    edit_token_mask,
+                    want_attention,
+                )
             if want_attention:
                 x, weights, transported_value = output
                 attention_maps.append(

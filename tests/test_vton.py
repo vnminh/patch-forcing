@@ -484,7 +484,7 @@ class VTONTests(unittest.TestCase):
             model = self._multiscale_model(garment_token_norm=enabled).eval()
             position = model._position_embedding(8, 6, torch.float32, "cpu")
             with torch.no_grad():
-                tokens, _ = model._garment_branches(
+                tokens, _, _ = model._garment_branches(
                     torch.randn(1, 4, 8, 6),
                     torch.randn(1, 16, 16, 12) * 30.0,
                     torch.randn(1, 8, 32, 24) * 3.0,
@@ -503,7 +503,7 @@ class VTONTests(unittest.TestCase):
         self.assertEqual(set(model.garment_token_norms), {"coarse", "middle", "detail"})
         position = model._position_embedding(8, 6, torch.float32, "cpu")
         with torch.no_grad():
-            tokens, _ = model._garment_branches(
+            tokens, values, _ = model._garment_branches(
                 torch.randn(1, 4, 8, 6) * 100.0, torch.randn(1, 16, 16, 12),
                 torch.randn(1, 8, 32, 24), torch.zeros(1, 12, 64), position, 8, 6,
             )
@@ -511,6 +511,7 @@ class VTONTests(unittest.TestCase):
         content = tokens["coarse"] - position
         self.assertAlmostEqual(float(content.var(-1, unbiased=False).mean()), 1.0, places=3)
         self.assertAlmostEqual(float(content.mean()), 0.0, places=4)
+        torch.testing.assert_close(content, values["coarse"])
 
     def test_entropy_is_normalised_by_the_usable_key_count(self):
         """Branches with different key counts must contribute comparably, so a uniform
@@ -739,7 +740,7 @@ class VTONTests(unittest.TestCase):
         latent = torch.randn(1, 4, 8, 6)
         position = model._position_embedding(8, 6, latent.dtype, latent.device)
         x = torch.zeros(1, 12, 64)
-        tokens, grids = model._garment_branches(
+        tokens, values, grids = model._garment_branches(
             torch.randn(1, 4, 8, 6),
             torch.randn(1, 16, 16, 12),
             torch.randn(1, 8, 32, 24),
@@ -754,6 +755,42 @@ class VTONTests(unittest.TestCase):
         self.assertEqual(grids["detail"], (8, 6))
         self.assertEqual(tokens["detail"].shape[1], 48)
         self.assertEqual(tokens["coarse"].shape[1], 12)
+        self.assertEqual(values["detail"].shape, tokens["detail"].shape)
+
+    def test_garment_values_exclude_position_while_keys_include_it(self):
+        model = self._multiscale_model(garment_token_norm=True).eval()
+        latent = torch.randn(1, 4, 8, 6)
+        position = model._position_embedding(8, 6, latent.dtype, latent.device)
+        keys, values, grids = model._garment_branches(
+            latent,
+            torch.randn(1, 16, 16, 12),
+            torch.randn(1, 8, 32, 24),
+            torch.zeros(1, 12, 64),
+            position,
+            8,
+            6,
+        )
+        for scale in ("coarse", "middle", "detail"):
+            expected_position = model._grid_position_embedding(
+                *grids[scale], values[scale].dtype, values[scale].device
+            )
+            torch.testing.assert_close(keys[scale], values[scale] + expected_position)
+
+    def test_512x384_detail_fix_config_is_interleaved_and_content_weighted(self):
+        from omegaconf import OmegaConf
+
+        config = OmegaConf.load(
+            Path(__file__).resolve().parents[1] / "configs/experiment/viton-pft-xl-512x384.yaml"
+        )
+        routes = list(config.model.params.garment_scale_routes)
+        self.assertEqual(len(routes), 14)
+        self.assertEqual(routes[:3], ["coarse", "middle", "detail"])
+        self.assertEqual(routes.count("coarse"), 4)
+        self.assertEqual(routes.count("middle"), 4)
+        self.assertEqual(routes.count("detail"), 6)
+        self.assertEqual(config.trainer.params.correspondence_photometric_weight, 0.5)
+        self.assertEqual(config.trainer.params.correspondence_value_weight, 0.5)
+        self.assertEqual(config.trainer.params.detail_loss_weight, 0.1)
 
     def test_routes_must_reference_enabled_branches(self):
         with self.assertRaises(ValueError):

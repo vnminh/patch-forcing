@@ -17,3 +17,6 @@ third_party
 .vscode
 **preview**
 **.env**
+
+**diagnostics**
+
